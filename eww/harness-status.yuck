@@ -1,0 +1,19 @@
+(deflisten harness-status-codex-spinner
+  :initial "⠋"
+  `while :; do for frame in ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏; do printf '%s\\n' "$frame"; sleep 0.08; done; done`)
+
+(deflisten harness-status-codex-json
+  :initial "{\"threads\":[]}"
+  "harness-status codex --follow")
+
+(defwidget harness-status-codex []
+  (box
+    :class "harness-status harness-status--codex"
+    :space-evenly false
+    (label :visible false :text "${harness-status-codex-spinner}")
+    (for thread in {harness-status-codex-json.threads}
+      (button
+        :class "harness-status__indicator harness-status__indicator--codex harness-status__indicator--${thread.state}"
+        :tooltip "${thread.harness}: ${thread.name} — ${thread.state}"
+        :onclick "harness-status ack '${thread.id}'"
+        {thread.state == "working" ? harness-status-codex-spinner : "✓"}))))

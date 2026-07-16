@@ -20,7 +20,8 @@ short-lived hook command
         v
 harness-status [codex] --follow
         |
-        | JSON object per line
+        | owns the registry, or subscribes to its existing owner
+        | JSON object per line for each follower
         v
 Eww deflisten
 ```
@@ -51,7 +52,7 @@ cargo install --path . --root "$HOME/.local"
 harness-status
 harness-status codex
 
-# Own the in-memory registry and print changed snapshots as JSONL.
+# Own the registry, or subscribe if another follower already owns it.
 harness-status --follow
 harness-status codex --follow
 
@@ -65,7 +66,9 @@ harness. Adding a harness name narrows the same JSON shape instead of creating a
 provider-specific contract.
 
 If no follower is running, snapshot mode prints `{"threads":[]}`. Only one
-follower can own the registry at a time.
+follower owns the registry, but any number of later `--follow` processes can
+subscribe to its current snapshot and future changes. Each subscriber keeps
+its own optional harness filter.
 
 ## JSON contract
 
@@ -76,7 +79,7 @@ follower can own the registry at a time.
       "id": "019abc...",
       "harness": "codex",
       "state": "working",
-      "cwd": "/home/lobo/code/example",
+      "cwd": "/home/alice/projects/example",
       "name": "example",
       "model": "gpt-5.6-sol",
       "turn_id": "019def...",
@@ -112,23 +115,38 @@ T3 Code launches the system Codex app-server with the inherited environment,
 so the same user-level hooks and runtime socket work without wrapping either
 program.
 
-## Eww
+## Eww module
 
-[`examples/harness-status.yuck`](examples/harness-status.yuck) contains a small
-Codex-only listener and indicator widget. Include it and place
-`(harness-indicators)` wherever the indicators should appear in the bar.
-Working Codex turns use the same ten-frame Braille spinner sequence as the
-Codex terminal title; completed turns use a check mark.
+Eww has no separate module registry or package format. Reusable widgets are
+ordinary Yuck files loaded with `include`; styles are included by the
+consumer's main CSS or SCSS file.
 
-The listener process is the in-memory owner:
+Copy [`eww/harness-status.yuck`](eww/harness-status.yuck) and optionally
+[`eww/harness-status.scss`](eww/harness-status.scss) into the Eww configuration,
+for example under `modules/harness-status/`. Then add this to `eww.yuck`:
 
 ```yuck
-(deflisten harness-status-json
-  :initial "{\"threads\":[]}"
-  "harness-status codex --follow")
+(include "./modules/harness-status/harness-status.yuck")
 ```
 
-Use `harness-status --follow` instead when the bar should include all harnesses.
+Add the optional structural styles to `eww.scss`:
+
+```scss
+@import "./modules/harness-status/harness-status.scss";
+```
+
+Place the exported widget wherever indicators should appear:
+
+```yuck
+(harness-status-codex)
+```
+
+The module defines no window or bar and assumes no window manager, monitor,
+paths, fonts, or palette. Consumers can theme the semantic classes
+`.harness-status__indicator--working` and
+`.harness-status__indicator--completed`. Working Codex turns use the same
+ten-frame Braille spinner sequence as the Codex terminal title; completed
+turns use a check mark. Clicking either state acknowledges the indicator.
 
 ## Verification
 

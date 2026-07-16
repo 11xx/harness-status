@@ -16,7 +16,9 @@ const REAP_INTERVAL: Duration = Duration::from_millis(500);
 const SUBSCRIBER_HEARTBEAT: Duration = Duration::from_secs(2);
 const STATE_VERSION: u32 = 1;
 const CODEX_HOOK_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
+const CLAUDE_HOOK_EVENTS: [&str; 3] = ["UserPromptSubmit", "Stop", "StopFailure"];
 const LEGACY_CODEX_HOOK_COMMAND: &str = "harness-status hook codex";
+const LEGACY_CLAUDE_HOOK_COMMAND: &str = "harness-status hook claude";
 
 #[derive(Debug)]
 enum Action {
@@ -37,7 +39,7 @@ struct Owner {
 }
 
 #[derive(Debug, Deserialize)]
-struct CodexHookInput {
+struct HarnessHookInput {
     hook_event_name: String,
     session_id: String,
     #[serde(default)]
@@ -162,8 +164,9 @@ impl Registry {
             model,
         } = event;
         let state = match (harness, event.as_str()) {
-            ("codex", "UserPromptSubmit") => "working",
-            ("codex", "Stop") => "completed",
+            ("codex" | "claude", "UserPromptSubmit") => "working",
+            ("codex" | "claude", "Stop") => "completed",
+            ("claude", "StopFailure") => "completed",
             _ => return false,
         };
 
@@ -388,14 +391,40 @@ Options:
 
 fn install_integration(harness: &str) -> io::Result<()> {
     match harness {
-        "codex" => install_codex_hooks(),
+        "codex" => install_hooks(
+            "Codex",
+            "codex",
+            codex_hooks_path()?,
+            &CODEX_HOOK_EVENTS,
+            LEGACY_CODEX_HOOK_COMMAND,
+        ),
+        "claude" => install_hooks(
+            "Claude Code",
+            "claude",
+            claude_settings_path()?,
+            &CLAUDE_HOOK_EVENTS,
+            LEGACY_CLAUDE_HOOK_COMMAND,
+        ),
         _ => Err(unsupported_harness(harness)),
     }
 }
 
 fn uninstall_integration(harness: &str) -> io::Result<()> {
     match harness {
-        "codex" => uninstall_codex_hooks(),
+        "codex" => uninstall_hooks(
+            "Codex",
+            "codex",
+            codex_hooks_path()?,
+            &CODEX_HOOK_EVENTS,
+            LEGACY_CODEX_HOOK_COMMAND,
+        ),
+        "claude" => uninstall_hooks(
+            "Claude Code",
+            "claude",
+            claude_settings_path()?,
+            &CLAUDE_HOOK_EVENTS,
+            LEGACY_CLAUDE_HOOK_COMMAND,
+        ),
         _ => Err(unsupported_harness(harness)),
     }
 }
@@ -407,11 +436,16 @@ fn unsupported_harness(harness: &str) -> io::Error {
     )
 }
 
-fn install_codex_hooks() -> io::Result<()> {
-    let display_path = codex_hooks_path()?;
+fn install_hooks(
+    display_name: &str,
+    harness: &str,
+    display_path: PathBuf,
+    events: &[&str],
+    legacy_command: &str,
+) -> io::Result<()> {
     let path = writable_config_path(&display_path)?;
     let mut document = read_hook_document(&path, true)?;
-    let command = codex_hook_command()?;
+    let command = hook_command(harness)?;
     let target_handler = json!({
         "type": "command",
         "command": command,
@@ -421,36 +455,48 @@ fn install_codex_hooks() -> io::Result<()> {
     let root = root_object_mut(&mut document, &display_path)?;
     let hooks = hooks_object_mut(root, &display_path)?;
     let mut changed = false;
-    for event in CODEX_HOOK_EVENTS {
-        changed |= install_event_handler(hooks, event, &target_handler, &command)?;
+    for &event in events {
+        changed |= install_event_handler(hooks, event, &target_handler, &command, legacy_command)?;
     }
 
     if changed {
         write_json_atomic(&path, &document)?;
-        println!("Installed Codex hooks in {}.", display_path.display());
-        println!("Restart Codex, then open /hooks to review and trust them.");
+        println!(
+            "Installed {display_name} hooks in {}.",
+            display_path.display()
+        );
+        if harness == "codex" {
+            println!("Restart Codex, then open /hooks to review and trust them.");
+        } else {
+            println!("Open /hooks in {display_name} to verify them.");
+        }
     } else {
         println!(
-            "Codex hooks are already installed in {}.",
+            "{display_name} hooks are already installed in {}.",
             display_path.display()
         );
     }
     Ok(())
 }
 
-fn uninstall_codex_hooks() -> io::Result<()> {
-    let display_path = codex_hooks_path()?;
+fn uninstall_hooks(
+    display_name: &str,
+    harness: &str,
+    display_path: PathBuf,
+    events: &[&str],
+    legacy_command: &str,
+) -> io::Result<()> {
     let path = writable_config_path(&display_path)?;
     if !path.exists() {
         println!(
-            "Codex hooks are already uninstalled from {}.",
+            "{display_name} hooks are already uninstalled from {}.",
             display_path.display()
         );
         return Ok(());
     }
 
     let mut document = read_hook_document(&path, false)?;
-    let command = codex_hook_command()?;
+    let command = hook_command(harness)?;
     let root = root_object_mut(&mut document, &display_path)?;
     let mut changed = false;
     let mut hooks_are_empty = false;
@@ -460,12 +506,12 @@ fn uninstall_codex_hooks() -> io::Result<()> {
             invalid_hook_config(&display_path, "top-level 'hooks' must be an object")
         })?;
         let mut empty_events = Vec::new();
-        for event in CODEX_HOOK_EVENTS {
+        for &event in events {
             if let Some(groups_value) = hooks.get_mut(event) {
                 let groups = groups_value.as_array_mut().ok_or_else(|| {
                     invalid_hook_config(&display_path, &format!("hooks.{event} must be an array"))
                 })?;
-                changed |= remove_owned_handlers(groups, event, &command)? > 0;
+                changed |= remove_owned_handlers(groups, event, &command, legacy_command)? > 0;
                 if groups.is_empty() {
                     empty_events.push(event);
                 }
@@ -483,11 +529,16 @@ fn uninstall_codex_hooks() -> io::Result<()> {
 
     if changed {
         write_json_atomic(&path, &document)?;
-        println!("Uninstalled Codex hooks from {}.", display_path.display());
-        println!("Restart Codex to stop using the removed definitions.");
+        println!(
+            "Uninstalled {display_name} hooks from {}.",
+            display_path.display()
+        );
+        if harness == "codex" {
+            println!("Restart Codex to stop using the removed definitions.");
+        }
     } else {
         println!(
-            "Codex hooks are already uninstalled from {}.",
+            "{display_name} hooks are already uninstalled from {}.",
             display_path.display()
         );
     }
@@ -509,6 +560,21 @@ fn codex_hooks_path() -> io::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".codex/hooks.json"))
 }
 
+fn claude_settings_path() -> io::Result<PathBuf> {
+    if let Some(config_dir) = env::var_os("CLAUDE_CONFIG_DIR").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(config_dir).join("settings.json"));
+    }
+    let home = env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "neither CLAUDE_CONFIG_DIR nor HOME is set",
+            )
+        })?;
+    Ok(PathBuf::from(home).join(".claude/settings.json"))
+}
+
 fn writable_config_path(path: &Path) -> io::Result<PathBuf> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path),
@@ -518,7 +584,7 @@ fn writable_config_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn codex_hook_command() -> io::Result<String> {
+fn hook_command(harness: &str) -> io::Result<String> {
     let executable = env::current_exe()?;
     let executable = executable.to_str().ok_or_else(|| {
         io::Error::new(
@@ -526,7 +592,7 @@ fn codex_hook_command() -> io::Result<String> {
             "harness-status executable path is not valid UTF-8",
         )
     })?;
-    Ok(format!("{} hook codex", shell_quote(executable)))
+    Ok(format!("{} hook {harness}", shell_quote(executable)))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -568,6 +634,7 @@ fn install_event_handler(
     event: &str,
     target_handler: &Value,
     command: &str,
+    legacy_command: &str,
 ) -> io::Result<bool> {
     if !hooks.contains_key(event) {
         hooks.insert(event.to_owned(), json!([]));
@@ -586,24 +653,29 @@ fn install_event_handler(
     let owned: Vec<&Value> = groups
         .iter()
         .flat_map(|group| group["hooks"].as_array().expect("validated hook group"))
-        .filter(|handler| handler_is_owned(handler, command))
+        .filter(|handler| handler_is_owned(handler, command, legacy_command))
         .collect();
     if owned.len() == 1 && owned[0] == target_handler {
         return Ok(false);
     }
 
-    remove_owned_handlers(groups, event, command)?;
+    remove_owned_handlers(groups, event, command, legacy_command)?;
     groups.push(json!({ "hooks": [target_handler.clone()] }));
     Ok(true)
 }
 
-fn remove_owned_handlers(groups: &mut Vec<Value>, event: &str, command: &str) -> io::Result<usize> {
+fn remove_owned_handlers(
+    groups: &mut Vec<Value>,
+    event: &str,
+    command: &str,
+    legacy_command: &str,
+) -> io::Result<usize> {
     validate_event_groups(groups, event)?;
     let mut removed = 0;
     for group in groups.iter_mut() {
         let handlers = group["hooks"].as_array_mut().expect("validated hook group");
         handlers.retain(|handler| {
-            if handler_is_owned(handler, command) {
+            if handler_is_owned(handler, command, legacy_command) {
                 removed += 1;
                 false
             } else {
@@ -636,12 +708,12 @@ fn validate_event_groups(groups: &[Value], event: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn handler_is_owned(handler: &Value, command: &str) -> bool {
+fn handler_is_owned(handler: &Value, command: &str, legacy_command: &str) -> bool {
     handler.get("type").and_then(Value::as_str) == Some("command")
         && handler
             .get("command")
             .and_then(Value::as_str)
-            .is_some_and(|candidate| candidate == command || candidate == LEGACY_CODEX_HOOK_COMMAND)
+            .is_some_and(|candidate| candidate == command || candidate == legacy_command)
 }
 
 fn invalid_hook_config(path: &Path, detail: &str) -> io::Error {
@@ -1012,22 +1084,26 @@ fn publish_subscribers(
 
 fn send_hook(harness: &str) {
     let event = match harness {
-        "codex" => serde_json::from_reader::<_, CodexHookInput>(io::stdin().lock()).map(|input| {
-            let transcript = input.transcript_path.map(|path| TranscriptCursor {
-                offset: fs::metadata(&path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0),
-                path,
-            });
-            HookEvent {
-                event: input.hook_event_name,
-                session_id: input.session_id,
-                turn_id: input.turn_id,
-                transcript,
-                cwd: input.cwd,
-                model: input.model,
-            }
-        }),
+        "codex" | "claude" => serde_json::from_reader::<_, HarnessHookInput>(io::stdin().lock())
+            .map(|input| {
+                let transcript = (harness == "codex")
+                    .then_some(input.transcript_path)
+                    .flatten()
+                    .map(|path| TranscriptCursor {
+                        offset: fs::metadata(&path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0),
+                        path,
+                    });
+                HookEvent {
+                    event: input.hook_event_name,
+                    session_id: input.session_id,
+                    turn_id: input.turn_id,
+                    transcript,
+                    cwd: input.cwd,
+                    model: input.model,
+                }
+            }),
         _ => return,
     };
     let Ok(event) = event else {
@@ -1037,7 +1113,7 @@ fn send_hook(harness: &str) {
     let request = Request::Hook {
         harness: harness.to_owned(),
         event,
-        owner: find_codex_owner(),
+        owner: find_harness_owner(harness),
     };
     send_fire_and_forget(&request);
 }
@@ -1158,11 +1234,16 @@ fn current_uid() -> Option<String> {
     line.split_ascii_whitespace().nth(1).map(str::to_owned)
 }
 
-fn find_codex_owner() -> Option<Owner> {
+fn find_harness_owner(harness: &str) -> Option<Owner> {
     let mut pid = process::id();
     for _ in 0..64 {
         let info = read_process(pid)?;
-        if info.comm == "codex" {
+        let matches_harness = match harness {
+            "codex" => info.comm == "codex",
+            "claude" => matches!(info.comm.as_str(), "claude" | "claude.exe"),
+            _ => false,
+        };
+        if matches_harness {
             return Some(Owner {
                 pid,
                 start_ticks: info.start_ticks,

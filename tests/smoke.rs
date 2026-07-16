@@ -42,6 +42,14 @@ fn codex_hook_to_jsonl_smoke() {
     };
     wait_for_socket(&socket);
 
+    let mut subscriber = Command::new(binary)
+        .args(["codex", "--follow"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_follow_socket(&dir);
+
     send_hook(binary, &socket, "UserPromptSubmit");
     let working = wait_for_state(binary, &socket, "working");
     assert_eq!(working["threads"][0]["id"], "thread-smoke");
@@ -60,6 +68,30 @@ fn codex_hook_to_jsonl_smoke() {
     );
     let empty = wait_for_thread_count(binary, &socket, 0);
     assert_eq!(empty["threads"].as_array().unwrap().len(), 0);
+
+    subscriber.kill().unwrap();
+    let output = subscriber.wait_with_output().unwrap();
+    let states: Vec<Option<String>> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .map(|snapshot| {
+            snapshot["threads"]
+                .as_array()
+                .and_then(|threads| threads.first())
+                .and_then(|thread| thread["state"].as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            None,
+            Some("working".to_owned()),
+            Some("completed".to_owned()),
+            None
+        ]
+    );
 }
 
 fn send_hook(binary: &str, socket: &Path, event: &str) {
@@ -85,6 +117,22 @@ fn wait_for_socket(socket: &Path) {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("follower did not create {}", socket.display());
+}
+
+fn wait_for_follow_socket(dir: &Path) {
+    for _ in 0..100 {
+        if fs::read_dir(dir).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".harness-status-follow-")
+        }) {
+            thread::sleep(Duration::from_millis(10));
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("subscriber did not create a follow socket");
 }
 
 fn wait_for_state(binary: &str, socket: &Path, state: &str) -> Value {

@@ -12,6 +12,7 @@ const DEFAULT_SOCKET_NAME: &str = "harness-status.sock";
 const MAX_DATAGRAM_SIZE: usize = 64 * 1024;
 const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const REAP_INTERVAL: Duration = Duration::from_millis(500);
+const SUBSCRIBER_HEARTBEAT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 enum Action {
@@ -61,6 +62,9 @@ enum Request {
     Snapshot {
         harness: Option<String>,
     },
+    Subscribe {
+        harness: Option<String>,
+    },
     Ack {
         id: String,
     },
@@ -84,6 +88,13 @@ struct ThreadStatus {
 struct Entry {
     status: ThreadStatus,
     owner: Option<Owner>,
+}
+
+#[derive(Debug)]
+struct Subscriber {
+    path: PathBuf,
+    harness: Option<String>,
+    last_json: String,
 }
 
 #[derive(Serialize)]
@@ -279,7 +290,7 @@ Commands:
   ack THREAD_ID      Remove a thread from the current registry
 
 Options:
-  -f, --follow       Keep running and print JSON whenever status changes
+  -f, --follow       Own or subscribe to the registry and print changed JSON
   -h, --help         Show this help
   -V, --version      Show the version"
     );
@@ -287,14 +298,27 @@ Options:
 
 fn follow(harness: Option<&str>) -> io::Result<()> {
     let path = socket_path()?;
-    prepare_server_socket(&path)?;
+    prepare_socket_parent(&path)?;
+
+    if path.exists() {
+        match query_snapshot(None) {
+            Ok(_) => return follow_existing(&path, harness),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                fs::remove_file(&path)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
     let socket = match UnixDatagram::bind(&path) {
         Ok(socket) => socket,
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                "another harness-status follower is already running",
-            ));
+            return follow_existing(&path, harness);
         }
         Err(error) => return Err(error),
     };
@@ -303,6 +327,7 @@ fn follow(harness: Option<&str>) -> io::Result<()> {
     socket.set_read_timeout(Some(REAP_INTERVAL))?;
 
     let mut registry = Registry::default();
+    let mut subscribers = Vec::new();
     let mut last_json = registry.snapshot_json(harness);
     print_json_line(&last_json);
 
@@ -324,6 +349,17 @@ fn follow(harness: Option<&str>) -> io::Result<()> {
                                 let _ = socket.send_to(response.as_bytes(), sender_path);
                             }
                         }
+                        Request::Subscribe { harness: requested } => {
+                            if let Some(sender_path) = sender.as_pathname() {
+                                subscribe(
+                                    &socket,
+                                    &registry,
+                                    &mut subscribers,
+                                    sender_path,
+                                    requested,
+                                );
+                            }
+                        }
                         Request::Ack { id } => changed = registry.acknowledge(&id),
                     }
                 }
@@ -343,25 +379,115 @@ fn follow(harness: Option<&str>) -> io::Result<()> {
                 print_json_line(&json);
                 last_json = json;
             }
+            publish_subscribers(&socket, &registry, &mut subscribers);
         }
     }
 }
 
-fn prepare_server_socket(path: &Path) -> io::Result<()> {
+fn prepare_socket_parent(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    if !path.exists() {
-        return Ok(());
+    Ok(())
+}
+
+fn follow_existing(server_path: &Path, harness: Option<&str>) -> io::Result<()> {
+    let client_path = client_socket_path(server_path, "follow");
+    let _ = fs::remove_file(&client_path);
+    let socket = UnixDatagram::bind(&client_path)?;
+    let _guard = SocketGuard {
+        path: client_path.clone(),
+    };
+    fs::set_permissions(&client_path, fs::Permissions::from_mode(0o600))?;
+    socket.set_read_timeout(Some(SUBSCRIBER_HEARTBEAT))?;
+
+    let request = Request::Subscribe {
+        harness: harness.map(str::to_owned),
+    };
+    let bytes = serde_json::to_vec(&request).map_err(io::Error::other)?;
+    send_subscription(&socket, &bytes, server_path)?;
+
+    let mut last_json = None;
+    let mut buffer = vec![0_u8; MAX_DATAGRAM_SIZE];
+    loop {
+        match socket.recv(&mut buffer) {
+            Ok(length) => {
+                let json = String::from_utf8(buffer[..length].to_vec())
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if last_json.as_deref() != Some(json.as_str()) {
+                    print_json_line(&json);
+                    last_json = Some(json);
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                send_subscription(&socket, &bytes, server_path)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn send_subscription(socket: &UnixDatagram, bytes: &[u8], server_path: &Path) -> io::Result<()> {
+    socket
+        .send_to(bytes, server_path)
+        .map(|_| ())
+        .map_err(|error| {
+            if missing_listener(&error) {
+                io::Error::new(io::ErrorKind::BrokenPipe, "harness-status owner stopped")
+            } else {
+                error
+            }
+        })
+}
+
+fn subscribe(
+    socket: &UnixDatagram,
+    registry: &Registry,
+    subscribers: &mut Vec<Subscriber>,
+    path: &Path,
+    harness: Option<String>,
+) {
+    let json = registry.snapshot_json(harness.as_deref());
+    if socket.send_to(json.as_bytes(), path).is_err() {
+        return;
     }
 
-    if query_snapshot(None).is_ok() {
-        return Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            "another harness-status follower is already running",
-        ));
+    if let Some(subscriber) = subscribers
+        .iter_mut()
+        .find(|subscriber| subscriber.path == path)
+    {
+        subscriber.harness = harness;
+        subscriber.last_json = json;
+    } else {
+        subscribers.push(Subscriber {
+            path: path.to_owned(),
+            harness,
+            last_json: json,
+        });
     }
-    fs::remove_file(path)
+}
+
+fn publish_subscribers(
+    socket: &UnixDatagram,
+    registry: &Registry,
+    subscribers: &mut Vec<Subscriber>,
+) {
+    subscribers.retain_mut(|subscriber| {
+        let json = registry.snapshot_json(subscriber.harness.as_deref());
+        if json == subscriber.last_json {
+            return true;
+        }
+        if socket.send_to(json.as_bytes(), &subscriber.path).is_err() {
+            return false;
+        }
+        subscriber.last_json = json;
+        true
+    });
 }
 
 fn send_hook(harness: &str) {
@@ -426,7 +552,7 @@ fn print_snapshot(harness: Option<&str>) -> io::Result<()> {
 
 fn query_snapshot(harness: Option<&str>) -> io::Result<String> {
     let server_path = socket_path()?;
-    let client_path = query_client_path(&server_path);
+    let client_path = client_socket_path(&server_path, "query");
     let _ = fs::remove_file(&client_path);
     let socket = UnixDatagram::bind(&client_path)?;
     let _guard = SocketGuard {
@@ -459,12 +585,12 @@ fn socket_path() -> io::Result<PathBuf> {
     Ok(env::temp_dir().join(format!("harness-status-{uid}.sock")))
 }
 
-fn query_client_path(server_path: &Path) -> PathBuf {
+fn client_socket_path(server_path: &Path, purpose: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let name = format!(".harness-status-query-{}-{nonce}.sock", process::id());
+    let name = format!(".harness-status-{purpose}-{}-{nonce}.sock", process::id());
     server_path
         .parent()
         .unwrap_or_else(|| Path::new("/tmp"))

@@ -117,6 +117,8 @@ program.
 [`examples/harness-status.yuck`](examples/harness-status.yuck) contains a small
 Codex-only listener and indicator widget. Include it and place
 `(harness-indicators)` wherever the indicators should appear in the bar.
+Working Codex turns use the same ten-frame Braille spinner sequence as the
+Codex terminal title; completed turns use a check mark.
 
 The listener process is the in-memory owner:
 

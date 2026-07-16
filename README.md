@@ -43,6 +43,7 @@ Rust 1.97 or newer is recommended.
 ```sh
 cargo build --release
 cargo install --path . --root "$HOME/.local"
+harness-status install codex
 ```
 
 ## Usage
@@ -59,6 +60,10 @@ harness-status codex --follow
 # Commands used by integrations and status-bar actions.
 harness-status hook codex
 harness-status ack 019abc-thread-id
+
+# Add or remove lifecycle callbacks from the harness's user configuration.
+harness-status install codex
+harness-status uninstall codex
 ```
 
 With no harness name, snapshot and follow modes include every supported
@@ -103,9 +108,24 @@ entry, including an interrupted turn that did not emit `Stop`.
 
 ## Codex hooks
 
-Install the binary first, then merge [`examples/codex-hooks.json`](examples/codex-hooks.json)
-into `~/.codex/hooks.json`. Codex combines matching hooks from its active
-configuration layers.
+Install the binary first, then let it merge the lifecycle callbacks into the
+Codex user configuration:
+
+```sh
+harness-status install codex
+```
+
+The command honors `$CODEX_HOME`, defaults to `~/.codex/hooks.json`, preserves
+unrelated definitions, and records the absolute path to the current executable.
+It is safe to repeat. To remove only the `harness-status` callbacks, run:
+
+```sh
+harness-status uninstall codex
+```
+
+The example [`examples/codex-hooks.json`](examples/codex-hooks.json) remains
+available for manual configuration. Codex combines matching hooks from its
+active configuration layers.
 
 Open `/hooks` in Codex once after installing or changing the definition and
 trust both commands. The callbacks are short-lived because Codex command hooks

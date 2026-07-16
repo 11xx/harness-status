@@ -29,6 +29,7 @@ fn codex_hook_to_jsonl_smoke() {
     let dir = std::env::temp_dir().join(format!("harness-status-test-{nonce}"));
     fs::create_dir(&dir).unwrap();
     let socket = dir.join("status.sock");
+    verify_codex_hook_lifecycle(binary, &dir);
 
     let child = Command::new(binary)
         .args(["codex", "--follow"])
@@ -92,6 +93,99 @@ fn codex_hook_to_jsonl_smoke() {
             None
         ]
     );
+}
+
+fn verify_codex_hook_lifecycle(binary: &str, dir: &Path) {
+    let codex_home = dir.join("codex-home");
+    fs::create_dir(&codex_home).unwrap();
+    let hooks_path = codex_home.join("hooks.json");
+    fs::write(
+        &hooks_path,
+        r#"{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "keep-me"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "harness-status hook codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let install = Command::new(binary)
+        .args(["install", "codex"])
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+    let installed_bytes = fs::read(&hooks_path).unwrap();
+    let installed: Value = serde_json::from_slice(&installed_bytes).unwrap();
+    assert_eq!(
+        installed["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        "keep-me"
+    );
+    for event in ["UserPromptSubmit", "Stop"] {
+        let handlers = installed["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["hooks"].as_array().unwrap());
+        let commands: Vec<&str> = handlers
+            .map(|handler| handler["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].ends_with("' hook codex"));
+        assert!(commands[0].contains(binary));
+    }
+
+    let reinstall = Command::new(binary)
+        .args(["install", "codex"])
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .unwrap();
+    assert!(reinstall.status.success());
+    assert_eq!(fs::read(&hooks_path).unwrap(), installed_bytes);
+
+    let uninstall = Command::new(binary)
+        .args(["uninstall", "codex"])
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .unwrap();
+    assert!(uninstall.status.success());
+    let uninstalled_bytes = fs::read(&hooks_path).unwrap();
+    let uninstalled: Value = serde_json::from_slice(&uninstalled_bytes).unwrap();
+    assert_eq!(
+        uninstalled["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        "keep-me"
+    );
+    assert!(uninstalled["hooks"].get("UserPromptSubmit").is_none());
+    assert!(uninstalled["hooks"].get("Stop").is_none());
+
+    let reuninstall = Command::new(binary)
+        .args(["uninstall", "codex"])
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .unwrap();
+    assert!(reuninstall.status.success());
+    assert_eq!(fs::read(&hooks_path).unwrap(), uninstalled_bytes);
 }
 
 fn send_hook(binary: &str, socket: &Path, event: &str) {

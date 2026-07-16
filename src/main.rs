@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,8 @@ const MAX_DATAGRAM_SIZE: usize = 64 * 1024;
 const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const REAP_INTERVAL: Duration = Duration::from_millis(500);
 const SUBSCRIBER_HEARTBEAT: Duration = Duration::from_secs(2);
+const CODEX_HOOK_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
+const LEGACY_CODEX_HOOK_COMMAND: &str = "harness-status hook codex";
 
 #[derive(Debug)]
 enum Action {
@@ -20,6 +23,8 @@ enum Action {
     Follow { harness: Option<String> },
     Hook { harness: String },
     Ack { id: String },
+    Install { harness: String },
+    Uninstall { harness: String },
     Help,
     Version,
 }
@@ -210,6 +215,8 @@ fn main() {
             Ok(())
         }
         Action::Ack { id } => acknowledge(&id),
+        Action::Install { harness } => install_integration(&harness),
+        Action::Uninstall { harness } => uninstall_integration(&harness),
         Action::Help => {
             print_help();
             Ok(())
@@ -247,6 +254,18 @@ fn parse_args() -> Result<Action, String> {
                 .ok_or_else(|| "'ack' requires a thread id".to_owned())?;
             no_more_args(args, Action::Ack { id })
         }
+        "install" => {
+            let harness = args
+                .next()
+                .ok_or_else(|| "'install' requires a harness name".to_owned())?;
+            no_more_args(args, Action::Install { harness })
+        }
+        "uninstall" => {
+            let harness = args
+                .next()
+                .ok_or_else(|| "'uninstall' requires a harness name".to_owned())?;
+            no_more_args(args, Action::Uninstall { harness })
+        }
         "-f" | "--follow" => {
             let harness = args.next();
             no_more_args(args, Action::Follow { harness })
@@ -280,20 +299,328 @@ Usage:
   harness-status --follow [HARNESS]
   harness-status hook HARNESS
   harness-status ack THREAD_ID
+  harness-status install HARNESS
+  harness-status uninstall HARNESS
 
 Print an in-memory AI harness status snapshot as JSON, or stream changed
 snapshots as JSONL. With no HARNESS, snapshot and follow modes include all
 configured harnesses.
 
 Commands:
-  hook HARNESS       Forward a harness hook event from stdin and exit
-  ack THREAD_ID      Remove a thread from the current registry
+  hook HARNESS        Forward a harness hook event from stdin and exit
+  ack THREAD_ID       Remove a thread from the current registry
+  install HARNESS     Install the harness integration in its user config
+  uninstall HARNESS   Remove the harness integration from its user config
 
 Options:
   -f, --follow       Own or subscribe to the registry and print changed JSON
   -h, --help         Show this help
   -V, --version      Show the version"
     );
+}
+
+fn install_integration(harness: &str) -> io::Result<()> {
+    match harness {
+        "codex" => install_codex_hooks(),
+        _ => Err(unsupported_harness(harness)),
+    }
+}
+
+fn uninstall_integration(harness: &str) -> io::Result<()> {
+    match harness {
+        "codex" => uninstall_codex_hooks(),
+        _ => Err(unsupported_harness(harness)),
+    }
+}
+
+fn unsupported_harness(harness: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("unsupported harness '{harness}'"),
+    )
+}
+
+fn install_codex_hooks() -> io::Result<()> {
+    let display_path = codex_hooks_path()?;
+    let path = writable_config_path(&display_path)?;
+    let mut document = read_hook_document(&path, true)?;
+    let command = codex_hook_command()?;
+    let target_handler = json!({
+        "type": "command",
+        "command": command,
+        "timeout": 5
+    });
+
+    let root = root_object_mut(&mut document, &display_path)?;
+    let hooks = hooks_object_mut(root, &display_path)?;
+    let mut changed = false;
+    for event in CODEX_HOOK_EVENTS {
+        changed |= install_event_handler(hooks, event, &target_handler, &command)?;
+    }
+
+    if changed {
+        write_json_atomic(&path, &document)?;
+        println!("Installed Codex hooks in {}.", display_path.display());
+        println!("Restart Codex, then open /hooks to review and trust them.");
+    } else {
+        println!(
+            "Codex hooks are already installed in {}.",
+            display_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn uninstall_codex_hooks() -> io::Result<()> {
+    let display_path = codex_hooks_path()?;
+    let path = writable_config_path(&display_path)?;
+    if !path.exists() {
+        println!(
+            "Codex hooks are already uninstalled from {}.",
+            display_path.display()
+        );
+        return Ok(());
+    }
+
+    let mut document = read_hook_document(&path, false)?;
+    let command = codex_hook_command()?;
+    let root = root_object_mut(&mut document, &display_path)?;
+    let mut changed = false;
+    let mut hooks_are_empty = false;
+
+    if let Some(hooks_value) = root.get_mut("hooks") {
+        let hooks = hooks_value.as_object_mut().ok_or_else(|| {
+            invalid_hook_config(&display_path, "top-level 'hooks' must be an object")
+        })?;
+        let mut empty_events = Vec::new();
+        for event in CODEX_HOOK_EVENTS {
+            if let Some(groups_value) = hooks.get_mut(event) {
+                let groups = groups_value.as_array_mut().ok_or_else(|| {
+                    invalid_hook_config(&display_path, &format!("hooks.{event} must be an array"))
+                })?;
+                changed |= remove_owned_handlers(groups, event, &command)? > 0;
+                if groups.is_empty() {
+                    empty_events.push(event);
+                }
+            }
+        }
+        for event in empty_events {
+            hooks.remove(event);
+        }
+        hooks_are_empty = hooks.is_empty();
+    }
+
+    if hooks_are_empty {
+        root.remove("hooks");
+    }
+
+    if changed {
+        write_json_atomic(&path, &document)?;
+        println!("Uninstalled Codex hooks from {}.", display_path.display());
+        println!("Restart Codex to stop using the removed definitions.");
+    } else {
+        println!(
+            "Codex hooks are already uninstalled from {}.",
+            display_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn codex_hooks_path() -> io::Result<PathBuf> {
+    if let Some(codex_home) = env::var_os("CODEX_HOME").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(codex_home).join("hooks.json"));
+    }
+    let home = env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "neither CODEX_HOME nor HOME is set",
+            )
+        })?;
+    Ok(PathBuf::from(home).join(".codex/hooks.json"))
+}
+
+fn writable_config_path(path: &Path) -> io::Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path),
+        Ok(_) => Ok(path.to_owned()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path.to_owned()),
+        Err(error) => Err(error),
+    }
+}
+
+fn codex_hook_command() -> io::Result<String> {
+    let executable = env::current_exe()?;
+    let executable = executable.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "harness-status executable path is not valid UTF-8",
+        )
+    })?;
+    Ok(format!("{} hook codex", shell_quote(executable)))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn read_hook_document(path: &Path, allow_missing: bool) -> io::Result<Value> {
+    match fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str(&contents)
+            .map_err(|error| invalid_hook_config(path, &format!("invalid JSON: {error}"))),
+        Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => Ok(json!({})),
+        Err(error) => Err(error),
+    }
+}
+
+fn root_object_mut<'a>(
+    document: &'a mut Value,
+    path: &Path,
+) -> io::Result<&'a mut Map<String, Value>> {
+    document
+        .as_object_mut()
+        .ok_or_else(|| invalid_hook_config(path, "the document root must be an object"))
+}
+
+fn hooks_object_mut<'a>(
+    root: &'a mut Map<String, Value>,
+    path: &Path,
+) -> io::Result<&'a mut Map<String, Value>> {
+    if !root.contains_key("hooks") {
+        root.insert("hooks".to_owned(), json!({}));
+    }
+    root.get_mut("hooks")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| invalid_hook_config(path, "top-level 'hooks' must be an object"))
+}
+
+fn install_event_handler(
+    hooks: &mut Map<String, Value>,
+    event: &str,
+    target_handler: &Value,
+    command: &str,
+) -> io::Result<bool> {
+    if !hooks.contains_key(event) {
+        hooks.insert(event.to_owned(), json!([]));
+    }
+    let groups = hooks
+        .get_mut(event)
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("hooks.{event} must be an array"),
+            )
+        })?;
+    validate_event_groups(groups, event)?;
+
+    let owned: Vec<&Value> = groups
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().expect("validated hook group"))
+        .filter(|handler| handler_is_owned(handler, command))
+        .collect();
+    if owned.len() == 1 && owned[0] == target_handler {
+        return Ok(false);
+    }
+
+    remove_owned_handlers(groups, event, command)?;
+    groups.push(json!({ "hooks": [target_handler.clone()] }));
+    Ok(true)
+}
+
+fn remove_owned_handlers(groups: &mut Vec<Value>, event: &str, command: &str) -> io::Result<usize> {
+    validate_event_groups(groups, event)?;
+    let mut removed = 0;
+    for group in groups.iter_mut() {
+        let handlers = group["hooks"].as_array_mut().expect("validated hook group");
+        handlers.retain(|handler| {
+            if handler_is_owned(handler, command) {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    groups.retain(|group| {
+        !group["hooks"]
+            .as_array()
+            .expect("validated hook group")
+            .is_empty()
+    });
+    Ok(removed)
+}
+
+fn validate_event_groups(groups: &[Value], event: &str) -> io::Result<()> {
+    for (index, group) in groups.iter().enumerate() {
+        let valid = group
+            .as_object()
+            .and_then(|group| group.get("hooks"))
+            .is_some_and(Value::is_array);
+        if !valid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("hooks.{event}[{index}].hooks must be an array"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn handler_is_owned(handler: &Value, command: &str) -> bool {
+    handler.get("type").and_then(Value::as_str) == Some("command")
+        && handler
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|candidate| candidate == command || candidate == LEGACY_CODEX_HOOK_COMMAND)
+}
+
+fn invalid_hook_config(path: &Path, detail: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("cannot update {}: {detail}", path.display()),
+    )
+}
+
+fn write_json_atomic(path: &Path, document: &Value) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hook path has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".hooks.json.harness-status-{}-{nonce}",
+        process::id()
+    ));
+    let permissions = fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+        .unwrap_or(0o600);
+    let mut contents = serde_json::to_vec_pretty(document).map_err(io::Error::other)?;
+    contents.push(b'\n');
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(permissions))?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn follow(harness: Option<&str>) -> io::Result<()> {

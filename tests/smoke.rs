@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -37,11 +38,17 @@ fn codex_hook_to_jsonl_smoke() {
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    let _follower = Follower {
+    let mut owner = Follower {
         child,
         dir: dir.clone(),
     };
     wait_for_socket(&socket);
+    let state_path = state_path(&socket);
+    wait_for_path(&state_path);
+    assert_eq!(
+        fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 
     let mut subscriber = Command::new(binary)
         .args(["codex", "--follow"])
@@ -55,6 +62,16 @@ fn codex_hook_to_jsonl_smoke() {
     fs::write(&transcript, "{\"type\":\"session_meta\"}\n").unwrap();
     send_hook(binary, &socket, "UserPromptSubmit", Some(&transcript));
     wait_for_state(binary, &socket, "working");
+    assert!(
+        !fs::read_to_string(&state_path)
+            .unwrap()
+            .contains("not retained")
+    );
+
+    owner.child.kill().unwrap();
+    owner.child.wait().unwrap();
+    wait_for_state(binary, &socket, "working");
+
     let mut transcript_file = fs::OpenOptions::new()
         .append(true)
         .open(&transcript)
@@ -82,6 +99,16 @@ fn codex_hook_to_jsonl_smoke() {
     send_hook(binary, &socket, "Stop", None);
     wait_for_state(binary, &socket, "completed");
 
+    subscriber.kill().unwrap();
+    let output = subscriber.wait_with_output().unwrap();
+
+    let mut replacement = Command::new(binary)
+        .args(["codex", "--follow"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_state(binary, &socket, "completed");
     assert!(
         Command::new(binary)
             .args(["ack", "thread-smoke"])
@@ -92,9 +119,19 @@ fn codex_hook_to_jsonl_smoke() {
     );
     let empty = wait_for_thread_count(binary, &socket, 0);
     assert_eq!(empty["threads"].as_array().unwrap().len(), 0);
+    replacement.kill().unwrap();
+    replacement.wait().unwrap();
 
-    subscriber.kill().unwrap();
-    let output = subscriber.wait_with_output().unwrap();
+    let mut final_owner = Command::new(binary)
+        .args(["codex", "--follow"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_thread_count(binary, &socket, 0);
+    final_owner.kill().unwrap();
+    final_owner.wait().unwrap();
+
     let states: Vec<Option<String>> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
@@ -114,8 +151,7 @@ fn codex_hook_to_jsonl_smoke() {
             Some("working".to_owned()),
             None,
             Some("working".to_owned()),
-            Some("completed".to_owned()),
-            None
+            Some("completed".to_owned())
         ]
     );
 }
@@ -237,17 +273,21 @@ fn send_hook(binary: &str, socket: &Path, event: &str, transcript_path: Option<&
 }
 
 fn wait_for_socket(socket: &Path) {
-    for _ in 0..100 {
-        if socket.exists() {
+    wait_for_path(socket);
+}
+
+fn wait_for_path(path: &Path) {
+    for _ in 0..500 {
+        if path.exists() {
             return;
         }
         thread::sleep(Duration::from_millis(10));
     }
-    panic!("follower did not create {}", socket.display());
+    panic!("path did not appear: {}", path.display());
 }
 
 fn wait_for_follow_socket(dir: &Path) {
-    for _ in 0..100 {
+    for _ in 0..500 {
         if fs::read_dir(dir).unwrap().flatten().any(|entry| {
             entry
                 .file_name()
@@ -263,7 +303,7 @@ fn wait_for_follow_socket(dir: &Path) {
 }
 
 fn wait_for_state(binary: &str, socket: &Path, state: &str) -> Value {
-    for _ in 0..100 {
+    for _ in 0..500 {
         let snapshot = snapshot(binary, socket);
         if snapshot["threads"]
             .as_array()
@@ -277,7 +317,7 @@ fn wait_for_state(binary: &str, socket: &Path, state: &str) -> Value {
 }
 
 fn wait_for_thread_count(binary: &str, socket: &Path, count: usize) -> Value {
-    for _ in 0..100 {
+    for _ in 0..500 {
         let snapshot = snapshot(binary, socket);
         if snapshot["threads"].as_array().map(Vec::len) == Some(count) {
             return snapshot;
@@ -295,4 +335,10 @@ fn snapshot(binary: &str, socket: &Path) -> Value {
         .unwrap();
     assert!(output.status.success());
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn state_path(socket: &Path) -> PathBuf {
+    let mut path = socket.to_owned();
+    path.set_extension("state.json");
+    path
 }

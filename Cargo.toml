@@ -2,7 +2,7 @@
 name = "harness-status"
 version = "0.1.0"
 edition = "2024"
-description = "In-memory AI harness status as snapshot JSON or a JSONL stream"
+description = "Volatile AI harness status as snapshot JSON or a JSONL stream"
 license = "Unlicense"
 
 [dependencies]

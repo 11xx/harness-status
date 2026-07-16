@@ -14,6 +14,7 @@ const MAX_DATAGRAM_SIZE: usize = 64 * 1024;
 const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const REAP_INTERVAL: Duration = Duration::from_millis(500);
 const SUBSCRIBER_HEARTBEAT: Duration = Duration::from_secs(2);
+const STATE_VERSION: u32 = 1;
 const CODEX_HOOK_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
 const LEGACY_CODEX_HOOK_COMMAND: &str = "harness-status hook codex";
 
@@ -100,7 +101,7 @@ enum Request {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ThreadStatus {
     id: String,
     harness: String,
@@ -114,7 +115,7 @@ struct ThreadStatus {
     updated_at: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Entry {
     status: ThreadStatus,
     owner: Option<Owner>,
@@ -136,6 +137,18 @@ struct Snapshot<'a> {
 #[derive(Default)]
 struct Registry {
     entries: Vec<Entry>,
+}
+
+#[derive(Deserialize)]
+struct StoredRegistry {
+    version: u32,
+    entries: Vec<Entry>,
+}
+
+#[derive(Serialize)]
+struct RegistryCheckpoint<'a> {
+    version: u32,
+    entries: &'a [Entry],
 }
 
 impl Registry {
@@ -680,37 +693,57 @@ fn write_json_atomic(path: &Path, document: &Value) -> io::Result<()> {
 fn follow(harness: Option<&str>) -> io::Result<()> {
     let path = socket_path()?;
     prepare_socket_parent(&path)?;
+    let mut last_json = None;
 
-    if path.exists() {
-        match query_snapshot(None) {
-            Ok(_) => return follow_existing(&path, harness),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                fs::remove_file(&path)?;
+    loop {
+        if path.exists() {
+            match query_snapshot(None) {
+                Ok(_) => {
+                    follow_existing(&path, harness, &mut last_json)?;
+                    continue;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    fs::remove_file(&path)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        match UnixDatagram::bind(&path) {
+            Ok(socket) => return follow_as_owner(socket, &path, harness, &mut last_json),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                follow_existing(&path, harness, &mut last_json)?;
             }
             Err(error) => return Err(error),
         }
     }
+}
 
-    let socket = match UnixDatagram::bind(&path) {
-        Ok(socket) => socket,
-        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-            return follow_existing(&path, harness);
-        }
-        Err(error) => return Err(error),
+fn follow_as_owner(
+    socket: UnixDatagram,
+    path: &Path,
+    harness: Option<&str>,
+    last_json: &mut Option<String>,
+) -> io::Result<()> {
+    let _guard = SocketGuard {
+        path: path.to_owned(),
     };
-    let _guard = SocketGuard { path: path.clone() };
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     socket.set_read_timeout(Some(REAP_INTERVAL))?;
 
-    let mut registry = Registry::default();
+    let state_path = registry_state_path(path);
+    let mut registry = load_registry(&state_path);
+    registry.reap_interrupted_turns();
+    registry.reap_dead_owners();
+    checkpoint_registry(&state_path, &registry);
     let mut subscribers = Vec::new();
-    let mut last_json = registry.snapshot_json(harness);
-    print_json_line(&last_json);
+    let initial_json = registry.snapshot_json(harness);
+    print_json_if_changed(last_json, initial_json);
 
     let mut buffer = vec![0_u8; MAX_DATAGRAM_SIZE];
     loop {
@@ -756,11 +789,9 @@ fn follow(harness: Option<&str>) -> io::Result<()> {
         changed |= registry.reap_interrupted_turns();
         changed |= registry.reap_dead_owners();
         if changed {
+            checkpoint_registry(&state_path, &registry);
             let json = registry.snapshot_json(harness);
-            if json != last_json {
-                print_json_line(&json);
-                last_json = json;
-            }
+            print_json_if_changed(last_json, json);
             publish_subscribers(&socket, &registry, &mut subscribers);
         }
     }
@@ -773,7 +804,11 @@ fn prepare_socket_parent(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn follow_existing(server_path: &Path, harness: Option<&str>) -> io::Result<()> {
+fn follow_existing(
+    server_path: &Path,
+    harness: Option<&str>,
+    last_json: &mut Option<String>,
+) -> io::Result<()> {
     let client_path = client_socket_path(server_path, "follow");
     let _ = fs::remove_file(&client_path);
     let socket = UnixDatagram::bind(&client_path)?;
@@ -787,19 +822,20 @@ fn follow_existing(server_path: &Path, harness: Option<&str>) -> io::Result<()> 
         harness: harness.map(str::to_owned),
     };
     let bytes = serde_json::to_vec(&request).map_err(io::Error::other)?;
-    send_subscription(&socket, &bytes, server_path)?;
+    if let Err(error) = send_subscription(&socket, &bytes, server_path) {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(error);
+    }
 
-    let mut last_json = None;
     let mut buffer = vec![0_u8; MAX_DATAGRAM_SIZE];
     loop {
         match socket.recv(&mut buffer) {
             Ok(length) => {
                 let json = String::from_utf8(buffer[..length].to_vec())
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                if last_json.as_deref() != Some(json.as_str()) {
-                    print_json_line(&json);
-                    last_json = Some(json);
-                }
+                print_json_if_changed(last_json, json);
             }
             Err(error)
                 if matches!(
@@ -807,10 +843,112 @@ fn follow_existing(server_path: &Path, harness: Option<&str>) -> io::Result<()> 
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                send_subscription(&socket, &bytes, server_path)?;
+                if let Err(error) = send_subscription(&socket, &bytes, server_path) {
+                    if error.kind() == io::ErrorKind::BrokenPipe {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn registry_state_path(socket_path: &Path) -> PathBuf {
+    let mut path = socket_path.to_owned();
+    path.set_extension("state.json");
+    path
+}
+
+fn load_registry(path: &Path) -> Registry {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Registry::default(),
+        Err(error) => {
+            eprintln!(
+                "harness-status: cannot read runtime state {}: {error}",
+                path.display()
+            );
+            return Registry::default();
+        }
+    };
+    let stored = match serde_json::from_slice::<StoredRegistry>(&bytes) {
+        Ok(stored) => stored,
+        Err(error) => {
+            eprintln!(
+                "harness-status: ignoring invalid runtime state {}: {error}",
+                path.display()
+            );
+            return Registry::default();
+        }
+    };
+    if stored.version != STATE_VERSION {
+        eprintln!(
+            "harness-status: ignoring runtime state version {} in {}",
+            stored.version,
+            path.display()
+        );
+        return Registry::default();
+    }
+    Registry {
+        entries: stored.entries,
+    }
+}
+
+fn checkpoint_registry(path: &Path, registry: &Registry) {
+    let checkpoint = RegistryCheckpoint {
+        version: STATE_VERSION,
+        entries: &registry.entries,
+    };
+    if let Err(error) = write_registry_checkpoint(path, &checkpoint) {
+        eprintln!(
+            "harness-status: cannot checkpoint runtime state {}: {error}",
+            path.display()
+        );
+    }
+}
+
+fn write_registry_checkpoint(path: &Path, checkpoint: &RegistryCheckpoint<'_>) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime state path has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".harness-status-state-{}-{nonce}.json",
+        process::id()
+    ));
+    let mut contents = serde_json::to_vec(checkpoint).map_err(io::Error::other)?;
+    contents.push(b'\n');
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn print_json_if_changed(last_json: &mut Option<String>, json: String) {
+    if last_json.as_deref() != Some(json.as_str()) {
+        print_json_line(&json);
+        *last_json = Some(json);
     }
 }
 

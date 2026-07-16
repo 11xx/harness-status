@@ -1,8 +1,9 @@
 # harness-status
 
 `harness-status` turns AI harness lifecycle hooks into a small, stable JSON
-contract for status bars. Its registry exists only in the process started with
-`--follow`: there is no database, state file, wrapper, or persistent daemon.
+contract for status bars. The process started with `--follow` owns the live
+registry and keeps a tiny volatile restart checkpoint; there is no database,
+history store, wrapper, or persistent daemon.
 
 The initial adapter supports Codex. The CLI and JSON shape leave room for other
 harnesses without making their implementations part of the Codex version.
@@ -33,8 +34,11 @@ break the harness.
 
 The socket is an ephemeral IPC endpoint at
 `$XDG_RUNTIME_DIR/harness-status.sock`, restricted to the current user. Set
-`HARNESS_STATUS_SOCKET` to override it. All thread state remains in memory and
-is lost when the follower exits.
+`HARNESS_STATUS_SOCKET` to override it. The owner atomically mirrors status
+metadata to a mode-0600 `.state.json` file beside the socket. A replacement
+owner restores live entries before printing its first snapshot and removes any
+whose recorded process identity is no longer alive. The runtime directory and
+checkpoint disappear at logout or reboot.
 
 ## Build and install
 
@@ -73,7 +77,8 @@ provider-specific contract.
 If no follower is running, snapshot mode prints `{"threads":[]}`. Only one
 follower owns the registry, but any number of later `--follow` processes can
 subscribe to its current snapshot and future changes. Each subscriber keeps
-its own optional harness filter.
+its own optional harness filter. If the owner exits, subscribers return to
+owner election; one restores the runtime checkpoint and the others resubscribe.
 
 ## JSON contract
 
@@ -99,7 +104,7 @@ lifecycle hooks:
 
 - `UserPromptSubmit` becomes `working`.
 - `Stop` becomes `completed` and remains visible until acknowledged, reused by
-  another prompt, its owning Codex process exits, or the follower restarts.
+  another prompt, or its owning Codex process exits.
 
 The hook does not retain prompts, transcript contents, permission details, or
 tool arguments. When it can identify the owning Codex process through `/proc`,

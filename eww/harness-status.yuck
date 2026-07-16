@@ -16,4 +16,4 @@
         :class "harness-status__indicator harness-status__indicator--codex harness-status__indicator--${thread.state}"
         :tooltip "${thread.harness}: ${thread.name} — ${thread.state}"
         :onclick "harness-status ack '${thread.id}'"
-        {thread.state == "working" ? harness-status-codex-spinner : "✓"}))))
+        {thread.state == "working" ? harness-status-codex-spinner : "•"}))))

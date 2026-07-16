@@ -99,12 +99,14 @@ lifecycle hooks:
 
 - `UserPromptSubmit` becomes `working`.
 - `Stop` becomes `completed` and remains visible until acknowledged, reused by
-  another prompt, or the follower restarts.
+  another prompt, its owning Codex process exits, or the follower restarts.
 
-The hook does not retain prompts, transcripts, permission details, or tool
-arguments. When it can identify the owning Codex process through `/proc`, the
-follower removes a `working` entry if that process exits. `ack` can dismiss any
-entry, including an interrupted turn that did not emit `Stop`.
+The hook does not retain prompts, transcript contents, permission details, or
+tool arguments. When it can identify the owning Codex process through `/proc`,
+the follower removes any entry after that process exits. To recognize an Esc
+interruption that does not emit `Stop`, the Codex adapter tails only new records
+from the hook-provided transcript path and reads the event type and turn ID. An
+unknown transcript format fails safely and leaves the click-to-ack fallback.
 
 ## Codex hooks
 
@@ -166,7 +168,9 @@ paths, fonts, or palette. Consumers can theme the semantic classes
 `.harness-status__indicator--working` and
 `.harness-status__indicator--completed`. Working Codex turns use the same
 ten-frame Braille spinner sequence as the Codex terminal title; completed
-turns use a check mark. Clicking either state acknowledges the indicator.
+turns use a small dot. Clicking either state acknowledges the indicator.
+These glyph choices live entirely in the Eww module; the JSON contract exposes
+state data rather than presentation icons.
 
 ## Verification
 

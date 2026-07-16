@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,8 @@ struct CodexHookInput {
     #[serde(default)]
     turn_id: Option<String>,
     #[serde(default)]
+    transcript_path: Option<PathBuf>,
+    #[serde(default)]
     cwd: String,
     #[serde(default)]
     model: String,
@@ -52,8 +54,31 @@ struct HookEvent {
     event: String,
     session_id: String,
     turn_id: Option<String>,
+    transcript: Option<TranscriptCursor>,
     cwd: String,
     model: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct TranscriptCursor {
+    path: PathBuf,
+    offset: u64,
+}
+
+#[derive(Deserialize)]
+struct TranscriptRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    payload: TranscriptPayload,
+}
+
+#[derive(Default, Deserialize)]
+struct TranscriptPayload {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    turn_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -93,6 +118,7 @@ struct ThreadStatus {
 struct Entry {
     status: ThreadStatus,
     owner: Option<Owner>,
+    transcript: Option<TranscriptCursor>,
 }
 
 #[derive(Debug)]
@@ -114,49 +140,62 @@ struct Registry {
 
 impl Registry {
     fn apply_hook(&mut self, harness: &str, event: HookEvent, owner: Option<Owner>) -> bool {
-        let state = match (harness, event.event.as_str()) {
+        let HookEvent {
+            event,
+            session_id,
+            turn_id,
+            transcript,
+            cwd,
+            model,
+        } = event;
+        let state = match (harness, event.as_str()) {
             ("codex", "UserPromptSubmit") => "working",
             ("codex", "Stop") => "completed",
             _ => return false,
         };
 
         let now = unix_time_seconds();
-        let name = display_name(&event.cwd);
-        let model = nonempty(event.model);
+        let name = display_name(&cwd);
+        let model = nonempty(model);
+        let starts_turn = state == "working";
 
         if let Some(entry) = self
             .entries
             .iter_mut()
-            .find(|entry| entry.status.harness == harness && entry.status.id == event.session_id)
+            .find(|entry| entry.status.harness == harness && entry.status.id == session_id)
         {
             entry.status.state = state.to_owned();
-            if !event.cwd.is_empty() {
-                entry.status.cwd = event.cwd;
+            if !cwd.is_empty() {
+                entry.status.cwd = cwd;
                 entry.status.name = name;
             }
             if model.is_some() {
                 entry.status.model = model;
             }
-            entry.status.turn_id = event.turn_id;
+            entry.status.turn_id = turn_id;
             entry.status.updated_at = now;
-            if owner.is_some() {
+            if starts_turn || owner.is_some() {
                 entry.owner = owner;
+            }
+            if starts_turn || transcript.is_some() {
+                entry.transcript = transcript;
             }
             return true;
         }
 
         self.entries.push(Entry {
             status: ThreadStatus {
-                id: event.session_id,
+                id: session_id,
                 harness: harness.to_owned(),
                 state: state.to_owned(),
-                cwd: event.cwd,
+                cwd,
                 name,
                 model,
-                turn_id: event.turn_id,
+                turn_id,
                 updated_at: now,
             },
             owner,
+            transcript,
         });
         true
     }
@@ -167,11 +206,26 @@ impl Registry {
         before != self.entries.len()
     }
 
-    fn reap_dead_workers(&mut self) -> bool {
+    fn reap_dead_owners(&mut self) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|entry| {
-            entry.status.state != "working"
-                || entry.owner.as_ref().is_none_or(process_matches_owner)
+        self.entries
+            .retain(|entry| entry.owner.as_ref().is_none_or(process_matches_owner));
+        before != self.entries.len()
+    }
+
+    fn reap_interrupted_turns(&mut self) -> bool {
+        let before = self.entries.len();
+        self.entries.retain_mut(|entry| {
+            if entry.status.state != "working" {
+                return true;
+            }
+            let Some(turn_id) = entry.status.turn_id.as_deref() else {
+                return true;
+            };
+            let Some(transcript) = entry.transcript.as_mut() else {
+                return true;
+            };
+            !transcript_reports_abort(transcript, turn_id).unwrap_or(false)
         });
         before != self.entries.len()
     }
@@ -699,7 +753,8 @@ fn follow(harness: Option<&str>) -> io::Result<()> {
             Err(error) => return Err(error),
         }
 
-        changed |= registry.reap_dead_workers();
+        changed |= registry.reap_interrupted_turns();
+        changed |= registry.reap_dead_owners();
         if changed {
             let json = registry.snapshot_json(harness);
             if json != last_json {
@@ -820,10 +875,17 @@ fn publish_subscribers(
 fn send_hook(harness: &str) {
     let event = match harness {
         "codex" => serde_json::from_reader::<_, CodexHookInput>(io::stdin().lock()).map(|input| {
+            let transcript = input.transcript_path.map(|path| TranscriptCursor {
+                offset: fs::metadata(&path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+                path,
+            });
             HookEvent {
                 event: input.hook_event_name,
                 session_id: input.session_id,
                 turn_id: input.turn_id,
+                transcript,
                 cwd: input.cwd,
                 model: input.model,
             }
@@ -840,6 +902,34 @@ fn send_hook(harness: &str) {
         owner: find_codex_owner(),
     };
     send_fire_and_forget(&request);
+}
+
+fn transcript_reports_abort(cursor: &mut TranscriptCursor, turn_id: &str) -> io::Result<bool> {
+    let mut file = fs::File::open(&cursor.path)?;
+    if file.metadata()?.len() < cursor.offset {
+        cursor.offset = 0;
+    }
+    file.seek(SeekFrom::Start(cursor.offset))?;
+    let mut reader = BufReader::new(file);
+
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 || !line.ends_with('\n') {
+            return Ok(false);
+        }
+        cursor.offset += bytes as u64;
+
+        let Ok(record) = serde_json::from_str::<TranscriptRecord>(&line) else {
+            continue;
+        };
+        if record.kind == "event_msg"
+            && record.payload.kind == "turn_aborted"
+            && record.payload.turn_id.as_deref() == Some(turn_id)
+        {
+            return Ok(true);
+        }
+    }
 }
 
 fn acknowledge(id: &str) -> io::Result<()> {

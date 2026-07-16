@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -51,12 +51,35 @@ fn codex_hook_to_jsonl_smoke() {
         .unwrap();
     wait_for_follow_socket(&dir);
 
-    send_hook(binary, &socket, "UserPromptSubmit");
+    let transcript = dir.join("transcript.jsonl");
+    fs::write(&transcript, "{\"type\":\"session_meta\"}\n").unwrap();
+    send_hook(binary, &socket, "UserPromptSubmit", Some(&transcript));
+    wait_for_state(binary, &socket, "working");
+    let mut transcript_file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    writeln!(
+        transcript_file,
+        "{}",
+        json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "turn_aborted",
+                "turn_id": "turn-smoke",
+                "reason": "interrupted"
+            }
+        })
+    )
+    .unwrap();
+    wait_for_thread_count(binary, &socket, 0);
+
+    send_hook(binary, &socket, "UserPromptSubmit", None);
     let working = wait_for_state(binary, &socket, "working");
     assert_eq!(working["threads"][0]["id"], "thread-smoke");
     assert_eq!(working["threads"][0]["name"], "example");
 
-    send_hook(binary, &socket, "Stop");
+    send_hook(binary, &socket, "Stop", None);
     wait_for_state(binary, &socket, "completed");
 
     assert!(
@@ -87,6 +110,8 @@ fn codex_hook_to_jsonl_smoke() {
     assert_eq!(
         states,
         [
+            None,
+            Some("working".to_owned()),
             None,
             Some("working".to_owned()),
             Some("completed".to_owned()),
@@ -188,16 +213,24 @@ fn verify_codex_hook_lifecycle(binary: &str, dir: &Path) {
     assert_eq!(fs::read(&hooks_path).unwrap(), uninstalled_bytes);
 }
 
-fn send_hook(binary: &str, socket: &Path, event: &str) {
+fn send_hook(binary: &str, socket: &Path, event: &str, transcript_path: Option<&Path>) {
     let mut child = Command::new(binary)
         .args(["hook", "codex"])
         .env("HARNESS_STATUS_SOCKET", socket)
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
-    write!(
+    serde_json::to_writer(
         child.stdin.take().unwrap(),
-        "{{\"hook_event_name\":\"{event}\",\"session_id\":\"thread-smoke\",\"turn_id\":\"turn-smoke\",\"cwd\":\"/tmp/example\",\"model\":\"gpt-smoke\",\"prompt\":\"not retained\"}}"
+        &json!({
+            "hook_event_name": event,
+            "session_id": "thread-smoke",
+            "turn_id": "turn-smoke",
+            "transcript_path": transcript_path,
+            "cwd": "/tmp/example",
+            "model": "gpt-smoke",
+            "prompt": "not retained"
+        }),
     )
     .unwrap();
     assert!(child.wait().unwrap().success());

@@ -218,7 +218,7 @@ fn claude_hook_to_jsonl_smoke() {
     );
     wait_for_state(binary, &socket, "claude", "working");
     send_hook(binary, &socket, "claude", "StopFailure", Some(&transcript));
-    wait_for_state(binary, &socket, "claude", "completed");
+    wait_for_state(binary, &socket, "claude", "attention");
     send_hook_with_notification_type(
         binary,
         &socket,
@@ -655,6 +655,8 @@ fn verify_pi_extension_lifecycle(binary: &str, dir: &Path) {
     assert!(installed.contains("session_start"));
     assert!(installed.contains("harness-status:attention"));
     assert!(installed.contains("harness-status:resume"));
+    assert!(installed.contains("harness-status:background"));
+    assert!(installed.contains("HARNESS_STATUS_DELEGATED"));
     assert!(installed.contains("Attention"));
     assert!(installed.contains("ResumeWorking"));
     assert!(installed.contains("ResumeCompleted"));

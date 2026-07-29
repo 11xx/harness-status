@@ -9,6 +9,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { spawn } from "node:child_process";
 
 const HARNESS_STATUS = "harness-status";
+const DELEGATED = process.env.HARNESS_STATUS_DELEGATED === "1";
 
 type PiStatusEvent = "AgentStart" | "AgentSettled" | "Attention" | "ResumeWorking" | "ResumeCompleted" | "SessionShutdown";
 
@@ -39,6 +40,7 @@ function report(event: PiStatusEvent, ctx: ExtensionContext): Promise<void> {
 				cwd: ctx.cwd,
 				model: ctx.model?.id ?? "",
 				owner_pid: process.pid,
+				delegated: DELEGATED,
 			}),
 		);
 	});
@@ -46,12 +48,14 @@ function report(event: PiStatusEvent, ctx: ExtensionContext): Promise<void> {
 
 export default function (pi: ExtensionAPI) {
 	let context: ExtensionContext | undefined;
+	let backgroundActive = false;
 
 	pi.on("session_start", (_event, ctx) => {
 		context = ctx;
+		backgroundActive = false;
 	});
 	pi.on("agent_start", (_event, ctx) => report("AgentStart", ctx));
-	pi.on("agent_settled", (_event, ctx) => report("AgentSettled", ctx));
+	pi.on("agent_settled", (_event, ctx) => backgroundActive ? undefined : report("AgentSettled", ctx));
 	pi.events.on("harness-status:attention", () => {
 		if (context) void report("Attention", context);
 	});
@@ -61,7 +65,14 @@ export default function (pi: ExtensionAPI) {
 		if (state === "working") void report("ResumeWorking", context);
 		else if (state === "completed") void report("ResumeCompleted", context);
 	});
+	pi.events.on("harness-status:background", (data) => {
+		const active = (data as { active?: unknown } | undefined)?.active;
+		if (typeof active !== "boolean") return;
+		backgroundActive = active;
+		if (active && context) void report("ResumeWorking", context);
+	});
 	pi.on("session_shutdown", async (_event, ctx) => {
+		backgroundActive = false;
 		await report("SessionShutdown", ctx);
 		context = undefined;
 	});

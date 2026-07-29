@@ -117,15 +117,17 @@ The `state` field is `working`, `completed`, or `attention`:
 - Codex and Claude Code `UserPromptSubmit` become `working`, while `Stop`
   becomes `completed`. Claude Code `SessionStart` also becomes `working` so
   non-interactive background runs are visible before their first prompt hook.
-- Claude Code's `StopFailure` also becomes `completed`. `Notification` becomes
-  `attention` only for `permission_prompt`, `idle_prompt`, and
-  `elicitation_dialog`; `auth_success` is ignored.
+- Claude Code's `StopFailure` becomes `attention`. `Notification` also becomes
+  `attention` for `permission_prompt`, `idle_prompt`, and `elicitation_dialog`;
+  `auth_success` is ignored.
 - pi `agent_start` becomes `working`, `agent_settled` becomes `completed` only
   after retries, automatic compaction, and queued continuations have finished,
   and the extension event `harness-status:attention` becomes `attention`.
   Cooperating extensions emit `harness-status:resume` with only a validated
-  `working` or `completed` state after their interaction closes.
-  `session_shutdown` removes the entry.
+  `working` or `completed` state after their interaction closes. They emit
+  `harness-status:background` with a boolean while supervised work is active;
+  Pi then ignores its intentional idle settlement until the child result wakes
+  the parent. `session_shutdown` removes the entry.
 
 A completed or attention entry remains visible until acknowledged, reused by
 another prompt, or its owning harness process exits. Pi also removes it during a clean
@@ -137,8 +139,10 @@ arguments contain only the harness display name, project display name, and
 `finished` or `needs attention`; they never contain working directories, model
 or session identifiers, prompts, responses, tools, or permission details.
 
-Only the registry owner sends a desktop notification, and only on a lifecycle
-transition into `completed` or `attention`. Resolving a reported interaction
+Only the registry owner sends a desktop notification, and only when explicit
+interaction is required or a top-level harness fully settles. Delegated child
+completion is recorded but does not notify; its parent remains working until it
+processes every child result and later settles. Resolving a reported interaction
 restores its prior semantic state without sending a second notification. The
 owner invokes `notify-send` directly without a shell. Set `HARNESS_STATUS_NOTIFY=0`, `false`, or `off` to disable notifications,
 or set `HARNESS_STATUS_NOTIFY_COMMAND` to override the executable. A missing,

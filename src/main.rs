@@ -66,6 +66,8 @@ struct HarnessHookInput {
     owner_pid: Option<u32>,
     #[serde(default)]
     notification_type: Option<String>,
+    #[serde(default)]
+    delegated: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -77,6 +79,8 @@ struct HookEvent {
     cwd: String,
     model: String,
     notification_type: Option<String>,
+    #[serde(default)]
+    delegated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -250,6 +254,7 @@ impl Registry {
             cwd,
             model,
             notification_type,
+            delegated,
         } = event;
         if harness == "pi" && event == "SessionShutdown" {
             let before = self.entries.len();
@@ -261,15 +266,14 @@ impl Registry {
             };
         }
 
-        let notify_transition = !matches!((harness, event.as_str()), ("pi", "ResumeCompleted"));
         let state = match (harness, event.as_str()) {
             ("claude", "SessionStart")
             | ("codex" | "claude", "UserPromptSubmit")
             | ("pi", "AgentStart" | "ResumeWorking") => "working",
-            ("codex" | "claude", "Stop")
-            | ("claude", "StopFailure")
-            | ("pi", "AgentSettled" | "ResumeCompleted") => "completed",
-            ("pi", "Attention") => "attention",
+            ("codex" | "claude", "Stop") | ("pi", "AgentSettled" | "ResumeCompleted") => {
+                "completed"
+            }
+            ("claude", "StopFailure") | ("pi", "Attention") => "attention",
             ("claude", "Notification")
                 if matches!(
                     notification_type.as_deref(),
@@ -286,6 +290,8 @@ impl Registry {
             }
         };
 
+        let notify_transition = !matches!((harness, event.as_str()), ("pi", "ResumeCompleted"))
+            && (state == "attention" || !delegated);
         let now = unix_time_seconds();
         let name = display_name(&cwd);
         let model = nonempty(model);
@@ -1357,6 +1363,7 @@ fn send_hook(harness: &str) {
         cwd: input.cwd,
         model: input.model,
         notification_type: input.notification_type,
+        delegated: input.delegated || delegated_process(),
     };
 
     let request = Request::Hook {
@@ -1536,6 +1543,11 @@ fn process_matches_owner(owner: &Owner) -> bool {
     read_process(owner.pid).is_some_and(|info| info.start_ticks == owner.start_ticks)
 }
 
+fn delegated_process() -> bool {
+    env::var("HARNESS_STATUS_DELEGATED")
+        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+}
+
 fn harness_display_name(harness: &str) -> &str {
     match harness {
         "codex" => "Codex",
@@ -1585,6 +1597,14 @@ mod tests {
     use super::*;
 
     fn event(name: &str, notification_type: Option<&str>) -> HookEvent {
+        event_with_delegation(name, notification_type, false)
+    }
+
+    fn event_with_delegation(
+        name: &str,
+        notification_type: Option<&str>,
+        delegated: bool,
+    ) -> HookEvent {
         HookEvent {
             event: name.to_owned(),
             session_id: "session".to_owned(),
@@ -1593,6 +1613,7 @@ mod tests {
             cwd: "/tmp/project".to_owned(),
             model: String::new(),
             notification_type: notification_type.map(str::to_owned),
+            delegated,
         }
     }
 
@@ -1630,6 +1651,24 @@ mod tests {
         assert!(!ignored.changed);
         assert!(ignored.notification.is_none());
         assert_eq!(registry.entries[0].status.state, "attention");
+    }
+
+    #[test]
+    fn delegated_completion_waits_for_the_parent_but_attention_notifies() {
+        let mut registry = Registry::default();
+
+        registry.apply_hook("pi", event_with_delegation("AgentStart", None, true), None);
+        let completed = registry.apply_hook(
+            "pi",
+            event_with_delegation("AgentSettled", None, true),
+            None,
+        );
+        assert!(completed.notification.is_none());
+        assert_eq!(registry.entries[0].status.state, "completed");
+
+        let attention =
+            registry.apply_hook("pi", event_with_delegation("Attention", None, true), None);
+        assert_eq!(attention.notification.unwrap().state, "attention");
     }
 
     #[test]

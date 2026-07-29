@@ -115,7 +115,8 @@ owner election; one restores the runtime checkpoint and the others resubscribe.
 The `state` field is `working`, `completed`, or `attention`:
 
 - Codex and Claude Code `UserPromptSubmit` become `working`, while `Stop`
-  becomes `completed`.
+  becomes `completed`. Claude Code `SessionStart` also becomes `working` so
+  non-interactive background runs are visible before their first prompt hook.
 - Claude Code's `StopFailure` also becomes `completed`. `Notification` becomes
   `attention` only for `permission_prompt`, `idle_prompt`, and
   `elicitation_dialog`; `auth_success` is ignored.

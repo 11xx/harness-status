@@ -17,7 +17,13 @@ const REAP_INTERVAL: Duration = Duration::from_millis(500);
 const SUBSCRIBER_HEARTBEAT: Duration = Duration::from_secs(2);
 const STATE_VERSION: u32 = 1;
 const CODEX_HOOK_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
-const CLAUDE_HOOK_EVENTS: [&str; 4] = ["UserPromptSubmit", "Stop", "StopFailure", "Notification"];
+const CLAUDE_HOOK_EVENTS: [&str; 5] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "StopFailure",
+    "Notification",
+];
 const NOTIFIER_TIMEOUT: Duration = Duration::from_secs(1);
 const LEGACY_CODEX_HOOK_COMMAND: &str = "harness-status hook codex";
 const LEGACY_CLAUDE_HOOK_COMMAND: &str = "harness-status hook claude";
@@ -256,7 +262,9 @@ impl Registry {
         }
 
         let state = match (harness, event.as_str()) {
-            ("codex" | "claude", "UserPromptSubmit") | ("pi", "AgentStart") => "working",
+            ("claude", "SessionStart")
+            | ("codex" | "claude", "UserPromptSubmit")
+            | ("pi", "AgentStart") => "working",
             ("codex" | "claude", "Stop") | ("claude", "StopFailure") | ("pi", "AgentSettled") => {
                 "completed"
             }

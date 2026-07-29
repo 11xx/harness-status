@@ -195,13 +195,7 @@ fn claude_hook_to_jsonl_smoke() {
 
     let transcript = dir.join("claude-transcript.jsonl");
     fs::write(&transcript, "sensitive transcript content\n").unwrap();
-    send_hook(
-        binary,
-        &socket,
-        "claude",
-        "UserPromptSubmit",
-        Some(&transcript),
-    );
+    send_hook(binary, &socket, "claude", "SessionStart", Some(&transcript));
     let working = wait_for_state(binary, &socket, "claude", "working");
     assert_eq!(working["threads"][0]["id"], "claude-thread-smoke");
     assert_eq!(working["threads"][0]["harness"], "claude");
@@ -583,17 +577,22 @@ fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {
         installed["hooks"]["SessionStart"][0]["hooks"][0]["command"],
         "also-keep-me"
     );
-    for event in ["UserPromptSubmit", "Stop", "StopFailure", "Notification"] {
-        let handlers = installed["hooks"][event]
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop",
+        "StopFailure",
+        "Notification",
+    ] {
+        let commands: Vec<&str> = installed["hooks"][event]
             .as_array()
             .unwrap()
             .iter()
-            .flat_map(|group| group["hooks"].as_array().unwrap());
-        let commands: Vec<&str> = handlers
-            .map(|handler| handler["command"].as_str().unwrap())
+            .flat_map(|group| group["hooks"].as_array().unwrap())
+            .filter_map(|handler| handler["command"].as_str())
+            .filter(|command| command.ends_with("' hook claude"))
             .collect();
         assert_eq!(commands.len(), 1);
-        assert!(commands[0].ends_with("' hook claude"));
         assert!(commands[0].contains(binary));
     }
 

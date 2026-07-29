@@ -6,8 +6,9 @@ use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::process;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{self, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SOCKET_NAME: &str = "harness-status.sock";
 const MAX_DATAGRAM_SIZE: usize = 64 * 1024;
@@ -16,7 +17,8 @@ const REAP_INTERVAL: Duration = Duration::from_millis(500);
 const SUBSCRIBER_HEARTBEAT: Duration = Duration::from_secs(2);
 const STATE_VERSION: u32 = 1;
 const CODEX_HOOK_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
-const CLAUDE_HOOK_EVENTS: [&str; 3] = ["UserPromptSubmit", "Stop", "StopFailure"];
+const CLAUDE_HOOK_EVENTS: [&str; 4] = ["UserPromptSubmit", "Stop", "StopFailure", "Notification"];
+const NOTIFIER_TIMEOUT: Duration = Duration::from_secs(1);
 const LEGACY_CODEX_HOOK_COMMAND: &str = "harness-status hook codex";
 const LEGACY_CLAUDE_HOOK_COMMAND: &str = "harness-status hook claude";
 const PI_EXTENSION_FILE: &str = "harness-status.ts";
@@ -56,6 +58,8 @@ struct HarnessHookInput {
     model: String,
     #[serde(default)]
     owner_pid: Option<u32>,
+    #[serde(default)]
+    notification_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -66,6 +70,7 @@ struct HookEvent {
     transcript: Option<TranscriptCursor>,
     cwd: String,
     model: String,
+    notification_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -142,6 +147,76 @@ struct Snapshot<'a> {
     threads: Vec<&'a ThreadStatus>,
 }
 
+struct HookResult {
+    changed: bool,
+    notification: Option<Notification>,
+}
+
+struct Notification {
+    harness: String,
+    project: String,
+    state: String,
+}
+
+struct Notifier {
+    command: Option<String>,
+}
+
+impl Notifier {
+    fn from_env() -> Self {
+        let enabled = env::var("HARNESS_STATUS_NOTIFY")
+            .map(|value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
+        let command = enabled.then(|| {
+            env::var("HARNESS_STATUS_NOTIFY_COMMAND").unwrap_or_else(|_| "notify-send".to_owned())
+        });
+        Self { command }
+    }
+
+    fn send(&self, notification: Notification) {
+        let Some(command) = self.command.as_deref() else {
+            return;
+        };
+        let title = harness_display_name(&notification.harness).to_owned();
+        let action = if notification.state == "attention" {
+            "needs attention"
+        } else {
+            "finished"
+        };
+        let body = format!("{} {action}", notification.project);
+        let child = Command::new(command)
+            .args([title, body])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Ok(mut child) = child {
+            thread::spawn(move || {
+                let deadline = Instant::now() + NOTIFIER_TIMEOUT;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => return,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return;
+                        }
+                        Ok(None) if Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Ok(None) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
 #[derive(Default)]
 struct Registry {
     entries: Vec<Entry>,
@@ -160,7 +235,7 @@ struct RegistryCheckpoint<'a> {
 }
 
 impl Registry {
-    fn apply_hook(&mut self, harness: &str, event: HookEvent, owner: Option<Owner>) -> bool {
+    fn apply_hook(&mut self, harness: &str, event: HookEvent, owner: Option<Owner>) -> HookResult {
         let HookEvent {
             event,
             session_id,
@@ -168,12 +243,16 @@ impl Registry {
             transcript,
             cwd,
             model,
+            notification_type,
         } = event;
         if harness == "pi" && event == "SessionShutdown" {
             let before = self.entries.len();
             self.entries
                 .retain(|entry| entry.status.harness != harness || entry.status.id != session_id);
-            return before != self.entries.len();
+            return HookResult {
+                changed: before != self.entries.len(),
+                notification: None,
+            };
         }
 
         let state = match (harness, event.as_str()) {
@@ -181,7 +260,21 @@ impl Registry {
             ("codex" | "claude", "Stop") | ("claude", "StopFailure") | ("pi", "AgentSettled") => {
                 "completed"
             }
-            _ => return false,
+            ("pi", "Attention") => "attention",
+            ("claude", "Notification")
+                if matches!(
+                    notification_type.as_deref(),
+                    Some("permission_prompt" | "idle_prompt" | "elicitation_dialog")
+                ) =>
+            {
+                "attention"
+            }
+            _ => {
+                return HookResult {
+                    changed: false,
+                    notification: None,
+                };
+            }
         };
 
         let now = unix_time_seconds();
@@ -194,6 +287,7 @@ impl Registry {
             .iter_mut()
             .find(|entry| entry.status.harness == harness && entry.status.id == session_id)
         {
+            let transitioned = entry.status.state != state;
             entry.status.state = state.to_owned();
             if !cwd.is_empty() {
                 entry.status.cwd = cwd;
@@ -210,7 +304,18 @@ impl Registry {
             if starts_turn || transcript.is_some() {
                 entry.transcript = transcript;
             }
-            return true;
+            let notification =
+                (transitioned && matches!(state, "completed" | "attention")).then(|| {
+                    Notification {
+                        harness: harness.to_owned(),
+                        project: entry.status.name.clone(),
+                        state: state.to_owned(),
+                    }
+                });
+            return HookResult {
+                changed: true,
+                notification,
+            };
         }
 
         self.entries.push(Entry {
@@ -227,7 +332,15 @@ impl Registry {
             owner,
             transcript,
         });
-        true
+        let notification = matches!(state, "completed" | "attention").then(|| Notification {
+            harness: harness.to_owned(),
+            project: display_name(&self.entries.last().expect("entry was inserted").status.cwd),
+            state: state.to_owned(),
+        });
+        HookResult {
+            changed: true,
+            notification,
+        }
     }
 
     fn acknowledge(&mut self, id: &str) -> bool {
@@ -918,6 +1031,7 @@ fn follow_as_owner(
     socket.set_read_timeout(Some(REAP_INTERVAL))?;
 
     let state_path = registry_state_path(path);
+    let notifier = Notifier::from_env();
     let mut registry = load_registry(&state_path);
     registry.reap_interrupted_turns();
     registry.reap_dead_owners();
@@ -929,6 +1043,7 @@ fn follow_as_owner(
     let mut buffer = vec![0_u8; MAX_DATAGRAM_SIZE];
     loop {
         let mut changed = false;
+        let mut notification = None;
         match socket.recv_from(&mut buffer) {
             Ok((length, sender)) => {
                 if let Ok(request) = serde_json::from_slice::<Request>(&buffer[..length]) {
@@ -937,7 +1052,11 @@ fn follow_as_owner(
                             harness: source,
                             event,
                             owner,
-                        } => changed = registry.apply_hook(&source, event, owner),
+                        } => {
+                            let result = registry.apply_hook(&source, event, owner);
+                            changed = result.changed;
+                            notification = result.notification;
+                        }
                         Request::Snapshot { harness: requested } => {
                             if let Some(sender_path) = sender.as_pathname() {
                                 let response = registry.snapshot_json(requested.as_deref());
@@ -974,6 +1093,9 @@ fn follow_as_owner(
             let json = registry.snapshot_json(harness);
             print_json_if_changed(last_json, json);
             publish_subscribers(&socket, &registry, &mut subscribers);
+        }
+        if let Some(notification) = notification {
+            notifier.send(notification);
         }
     }
 }
@@ -1221,6 +1343,7 @@ fn send_hook(harness: &str) {
         transcript,
         cwd: input.cwd,
         model: input.model,
+        notification_type: input.notification_type,
     };
 
     let request = Request::Hook {
@@ -1400,6 +1523,15 @@ fn process_matches_owner(owner: &Owner) -> bool {
     read_process(owner.pid).is_some_and(|info| info.start_ticks == owner.start_ticks)
 }
 
+fn harness_display_name(harness: &str) -> &str {
+    match harness {
+        "codex" => "Codex",
+        "claude" => "Claude Code",
+        "pi" => "Pi",
+        _ => harness,
+    }
+}
+
 fn display_name(cwd: &str) -> String {
     Path::new(cwd)
         .file_name()
@@ -1433,4 +1565,57 @@ fn missing_listener(error: &io::Error) -> bool {
         error.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused | io::ErrorKind::WouldBlock
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(name: &str, notification_type: Option<&str>) -> HookEvent {
+        HookEvent {
+            event: name.to_owned(),
+            session_id: "session".to_owned(),
+            turn_id: None,
+            transcript: None,
+            cwd: "/tmp/project".to_owned(),
+            model: String::new(),
+            notification_type: notification_type.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn notifications_follow_semantic_state_transitions() {
+        let mut registry = Registry::default();
+
+        let working = registry.apply_hook("claude", event("UserPromptSubmit", None), None);
+        assert!(working.changed);
+        assert!(working.notification.is_none());
+
+        let completed = registry.apply_hook("claude", event("Stop", None), None);
+        assert!(completed.changed);
+        assert_eq!(completed.notification.unwrap().state, "completed");
+
+        let duplicate_completed = registry.apply_hook("claude", event("Stop", None), None);
+        assert!(duplicate_completed.changed);
+        assert!(duplicate_completed.notification.is_none());
+
+        let attention = registry.apply_hook(
+            "claude",
+            event("Notification", Some("permission_prompt")),
+            None,
+        );
+        assert!(attention.changed);
+        assert_eq!(attention.notification.unwrap().state, "attention");
+
+        let duplicate_attention =
+            registry.apply_hook("claude", event("Notification", Some("idle_prompt")), None);
+        assert!(duplicate_attention.changed);
+        assert!(duplicate_attention.notification.is_none());
+
+        let ignored =
+            registry.apply_hook("claude", event("Notification", Some("auth_success")), None);
+        assert!(!ignored.changed);
+        assert!(ignored.notification.is_none());
+        assert_eq!(registry.entries[0].status.state, "attention");
+    }
 }

@@ -6,7 +6,8 @@ registry and keeps a tiny volatile restart checkpoint; there is no database,
 history store, wrapper, or persistent daemon.
 
 The adapters support Codex, Claude Code, and pi behind the same CLI and JSON
-shape.
+shape. The registry owner can also send generic desktop notifications for
+completed turns and requests for attention.
 
 ## How it works
 
@@ -111,24 +112,37 @@ owner election; one restores the runtime checkpoint and the others resubscribe.
 }
 ```
 
-Each adapter reports only states supported cleanly by its lifecycle API:
+The `state` field is `working`, `completed`, or `attention`:
 
 - Codex and Claude Code `UserPromptSubmit` become `working`, while `Stop`
   becomes `completed`.
-- Claude Code's `StopFailure` also becomes `completed`: the turn is no longer
-  working and needs attention, but the adapter does not expose or retain its
-  error details.
-- pi `agent_start` becomes `working`, and `agent_settled` becomes `completed`
-  only after retries, automatic compaction, and queued continuations have
-  finished. `session_shutdown` removes the entry.
+- Claude Code's `StopFailure` also becomes `completed`. `Notification` becomes
+  `attention` only for `permission_prompt`, `idle_prompt`, and
+  `elicitation_dialog`; `auth_success` is ignored.
+- pi `agent_start` becomes `working`, `agent_settled` becomes `completed` only
+  after retries, automatic compaction, and queued continuations have finished,
+  and the extension event `harness-status:attention` becomes `attention`.
+  `session_shutdown` removes the entry.
 
-A completed entry remains visible until acknowledged, reused by another
-prompt, or its owning harness process exits. Pi also removes it during a clean
+A completed or attention entry remains visible until acknowledged, reused by
+another prompt, or its owning harness process exits. Pi also removes it during a clean
 session shutdown.
 
 The hook does not retain prompts, transcript contents, permission details, tool
-arguments, Claude's last response, or stop-failure details. When it can identify
-the owning harness process through `/proc`, the follower removes the entry after
+arguments, Claude's last response, or stop-failure details. Desktop notification
+arguments contain only the harness display name, project display name, and
+`finished` or `needs attention`; they never contain working directories, model
+or session identifiers, prompts, responses, tools, or permission details.
+
+Only the registry owner sends a desktop notification, and only on a transition
+into `completed` or `attention`. It invokes `notify-send` directly without a
+shell. Set `HARNESS_STATUS_NOTIFY=0`, `false`, or `off` to disable notifications,
+or set `HARNESS_STATUS_NOTIFY_COMMAND` to override the executable. A missing,
+failing, or slow notifier does not affect status publication; notifier processes
+are reaped asynchronously and killed after one second. Delivery is best-effort:
+an owner process that exits between checkpointing a transition and spawning its
+notifier can lose that notification. When it can identify the owning harness
+process through `/proc`, the follower removes the entry after
 that process exits.
 
 To recognize an Esc interruption that does not emit `Stop`, the Codex adapter
@@ -251,6 +265,7 @@ The module defines no window or bar and assumes no window manager, monitor,
 paths, fonts, or consumer palette variables. Consumers can theme the semantic classes
 `.harness-status__indicator--working`,
 `.harness-status__indicator--completed`,
+`.harness-status__indicator--attention`,
 `.harness-status__indicator--codex`,
 `.harness-status__indicator--claude`, and
 `.harness-status__indicator--pi`. Working Codex turns use their ten-frame
@@ -259,9 +274,10 @@ Linux pulse sequence (`· ✢ * ✶ ✻ ✽` and back) at 300 ms per frame. All
 animation stays in Eww
 rather than the JSON stream. Completed Codex turns use a small dot, completed
 Claude turns use Claude Code's static `✻`, and completed pi turns use `π`.
-Clicking any state acknowledges the indicator.
+Attention uses a static `!` for every harness. Clicking any state acknowledges
+the indicator.
 
-All adapters share the same semantic working/completed color classes, so pi
+All adapters share the same semantic working/completed/attention classes, so pi
 stays consistent with the other Eww indicators. Glyph choices live entirely in
 the Eww module; the JSON contract exposes state data rather than presentation.
 

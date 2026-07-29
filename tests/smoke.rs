@@ -2,10 +2,11 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct Follower {
     child: Child,
@@ -35,6 +36,7 @@ fn codex_hook_to_jsonl_smoke() {
     let child = Command::new(binary)
         .args(["codex", "--follow"])
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
@@ -53,6 +55,7 @@ fn codex_hook_to_jsonl_smoke() {
     let mut subscriber = Command::new(binary)
         .args(["codex", "--follow"])
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -111,6 +114,7 @@ fn codex_hook_to_jsonl_smoke() {
     let mut replacement = Command::new(binary)
         .args(["codex", "--follow"])
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
@@ -119,6 +123,7 @@ fn codex_hook_to_jsonl_smoke() {
         Command::new(binary)
             .args(["ack", "thread-smoke"])
             .env("HARNESS_STATUS_SOCKET", &socket)
+            .env("HARNESS_STATUS_NOTIFY", "0")
             .status()
             .unwrap()
             .success()
@@ -131,6 +136,7 @@ fn codex_hook_to_jsonl_smoke() {
     let mut final_owner = Command::new(binary)
         .args(["codex", "--follow"])
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
@@ -177,6 +183,7 @@ fn claude_hook_to_jsonl_smoke() {
     let child = Command::new(binary)
         .args(["claude", "--follow"])
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
@@ -218,15 +225,161 @@ fn claude_hook_to_jsonl_smoke() {
     wait_for_state(binary, &socket, "claude", "working");
     send_hook(binary, &socket, "claude", "StopFailure", Some(&transcript));
     wait_for_state(binary, &socket, "claude", "completed");
+    send_hook_with_notification_type(
+        binary,
+        &socket,
+        "claude",
+        "Notification",
+        Some("permission_prompt"),
+    );
+    wait_for_state(binary, &socket, "claude", "attention");
     assert!(
         Command::new(binary)
             .args(["ack", "claude-thread-smoke"])
             .env("HARNESS_STATUS_SOCKET", &socket)
+            .env("HARNESS_STATUS_NOTIFY", "0")
             .status()
             .unwrap()
             .success()
     );
     wait_for_thread_count(binary, &socket, "claude", 0);
+}
+
+#[test]
+fn desktop_notifications_are_generic_and_transition_only() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-notify-test-{nonce}"));
+    fs::create_dir(&dir).unwrap();
+    let socket = dir.join("status.sock");
+    let output = dir.join("notifications");
+    let notifier = dir.join("notifier");
+    fs::write(
+        &notifier,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+            output.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&notifier, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let child = Command::new(binary)
+        .args(["claude", "--follow"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY_COMMAND", &notifier)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _follower = Follower {
+        child,
+        dir: dir.clone(),
+    };
+    wait_for_socket(&socket);
+
+    send_notification_hook(binary, &socket, "UserPromptSubmit", None);
+    wait_for_state(binary, &socket, "claude", "working");
+    send_notification_hook(binary, &socket, "Stop", None);
+    wait_for_state(binary, &socket, "claude", "completed");
+    send_notification_hook(binary, &socket, "Notification", Some("permission_prompt"));
+    wait_for_state(binary, &socket, "claude", "attention");
+    let lines = wait_for_lines(&output, 4);
+    assert_eq!(
+        lines,
+        [
+            "Claude Code",
+            "example finished",
+            "Claude Code",
+            "example needs attention"
+        ]
+    );
+    assert!(
+        !fs::read_to_string(&output)
+            .unwrap()
+            .contains("sensitive-secret")
+    );
+}
+
+#[test]
+fn notifier_failures_do_not_prevent_publication() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    for (index, command) in ["/missing/harness-status-notifier", "/bin/false"]
+        .into_iter()
+        .enumerate()
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "harness-status-notifier-failure-{}-{index}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let socket = dir.join("status.sock");
+        let mut child = Command::new(binary)
+            .args(["codex", "--follow"])
+            .env("HARNESS_STATUS_SOCKET", &socket)
+            .env("HARNESS_STATUS_NOTIFY_COMMAND", command)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for_socket(&socket);
+        send_notification_hook_for(binary, &socket, "codex", "Stop", None);
+        wait_for_state(binary, &socket, "codex", "completed");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn slow_notifier_is_killed_and_reaped_without_blocking_publication() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-slow-notifier-{nonce}"));
+    fs::create_dir(&dir).unwrap();
+    let socket = dir.join("status.sock");
+    let pid_file = dir.join("notifier.pid");
+    let notifier = dir.join("notifier");
+    fs::write(
+        &notifier,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&notifier, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let child = Command::new(binary)
+        .args(["codex", "--follow"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY_COMMAND", &notifier)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _follower = Follower {
+        child,
+        dir: dir.clone(),
+    };
+    wait_for_socket(&socket);
+
+    let started = Instant::now();
+    let snapshot = send_ordered_hook_and_snapshot(&dir, &socket, "codex", "Stop", None);
+    assert_eq!(snapshot["threads"][0]["state"], "completed");
+    assert!(
+        started.elapsed() < Duration::from_millis(750),
+        "notifier delayed state publication for {:?}",
+        started.elapsed()
+    );
+
+    wait_for_path(&pid_file);
+    let pid = fs::read_to_string(&pid_file).unwrap();
+    let process_path = PathBuf::from(format!("/proc/{}", pid.trim()));
+    wait_for_path_absent(&process_path);
 }
 
 #[test]
@@ -244,6 +397,7 @@ fn pi_extension_to_jsonl_smoke() {
     let child = Command::new(binary)
         .args(["pi", "--follow"])
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
@@ -265,6 +419,8 @@ fn pi_extension_to_jsonl_smoke() {
 
     send_hook(binary, &socket, "pi", "AgentSettled", None);
     wait_for_state(binary, &socket, "pi", "completed");
+    send_hook(binary, &socket, "pi", "Attention", None);
+    wait_for_state(binary, &socket, "pi", "attention");
     send_hook(binary, &socket, "pi", "AgentStart", None);
     wait_for_state(binary, &socket, "pi", "working");
     send_hook(binary, &socket, "pi", "SessionShutdown", None);
@@ -427,7 +583,7 @@ fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {
         installed["hooks"]["SessionStart"][0]["hooks"][0]["command"],
         "also-keep-me"
     );
-    for event in ["UserPromptSubmit", "Stop", "StopFailure"] {
+    for event in ["UserPromptSubmit", "Stop", "StopFailure", "Notification"] {
         let handlers = installed["hooks"][event]
             .as_array()
             .unwrap()
@@ -465,6 +621,7 @@ fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {
     assert!(uninstalled["hooks"].get("UserPromptSubmit").is_none());
     assert!(uninstalled["hooks"].get("Stop").is_none());
     assert!(uninstalled["hooks"].get("StopFailure").is_none());
+    assert!(uninstalled["hooks"].get("Notification").is_none());
 
     let reuninstall = Command::new(binary)
         .args(["uninstall", "claude"])
@@ -492,6 +649,9 @@ fn verify_pi_extension_lifecycle(binary: &str, dir: &Path) {
     assert!(installed.contains("agent_start"));
     assert!(installed.contains("agent_settled"));
     assert!(installed.contains("session_shutdown"));
+    assert!(installed.contains("session_start"));
+    assert!(installed.contains("harness-status:attention"));
+    assert!(installed.contains("Attention"));
     assert_eq!(
         fs::metadata(&extension_path).unwrap().permissions().mode() & 0o777,
         0o600
@@ -557,6 +717,7 @@ fn send_hook_with_owner(
     let mut child = Command::new(binary)
         .args(["hook", harness])
         .env("HARNESS_STATUS_SOCKET", socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -587,6 +748,121 @@ fn send_hook_with_owner(
     assert!(child.wait().unwrap().success());
 }
 
+fn send_ordered_hook_and_snapshot(
+    dir: &Path,
+    socket: &Path,
+    harness: &str,
+    event: &str,
+    notification_type: Option<&str>,
+) -> Value {
+    let client_path = dir.join("ordered-client.sock");
+    let client = UnixDatagram::bind(&client_path).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let hook = json!({
+        "op": "hook",
+        "harness": harness,
+        "event": {
+            "event": event,
+            "session_id": format!("{harness}-ordered-smoke"),
+            "turn_id": null,
+            "transcript": null,
+            "cwd": "/tmp/example",
+            "model": "",
+            "notification_type": notification_type
+        },
+        "owner": null
+    });
+    client
+        .send_to(&serde_json::to_vec(&hook).unwrap(), socket)
+        .unwrap();
+    let request = json!({"op": "snapshot", "harness": harness});
+    client
+        .send_to(&serde_json::to_vec(&request).unwrap(), socket)
+        .unwrap();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let length = client.recv(&mut buffer).unwrap();
+    serde_json::from_slice(&buffer[..length]).unwrap()
+}
+
+fn send_hook_with_notification_type(
+    binary: &str,
+    socket: &Path,
+    harness: &str,
+    event: &str,
+    notification_type: Option<&str>,
+) {
+    let mut child = Command::new(binary)
+        .args(["hook", harness])
+        .env("HARNESS_STATUS_SOCKET", socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        child.stdin.take().unwrap(),
+        &json!({
+            "hook_event_name": event,
+            "session_id": "claude-thread-smoke",
+            "cwd": "/tmp/example",
+            "notification_type": notification_type
+        }),
+    )
+    .unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+fn send_notification_hook(
+    binary: &str,
+    socket: &Path,
+    event: &str,
+    notification_type: Option<&str>,
+) {
+    send_notification_hook_for(binary, socket, "claude", event, notification_type);
+}
+
+fn send_notification_hook_for(
+    binary: &str,
+    socket: &Path,
+    harness: &str,
+    event: &str,
+    notification_type: Option<&str>,
+) {
+    let mut child = Command::new(binary)
+        .args(["hook", harness])
+        .env("HARNESS_STATUS_SOCKET", socket)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        child.stdin.take().unwrap(),
+        &json!({
+            "hook_event_name": event,
+            "session_id": format!("{harness}-notification-smoke"),
+            "cwd": "/tmp/example",
+            "owner_pid": std::process::id(),
+            "notification_type": notification_type,
+            "prompt": "sensitive-secret"
+        }),
+    )
+    .unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+fn wait_for_lines(path: &Path, count: usize) -> Vec<String> {
+    for _ in 0..500 {
+        if let Ok(contents) = fs::read_to_string(path) {
+            let lines: Vec<String> = contents.lines().map(str::to_owned).collect();
+            if lines.len() >= count {
+                return lines;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("file never reached {count} lines: {}", path.display());
+}
+
 fn wait_for_socket(socket: &Path) {
     wait_for_path(socket);
 }
@@ -599,6 +875,16 @@ fn wait_for_path(path: &Path) {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("path did not appear: {}", path.display());
+}
+
+fn wait_for_path_absent(path: &Path) {
+    for _ in 0..300 {
+        if !path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("path did not disappear: {}", path.display());
 }
 
 fn wait_for_follow_socket(dir: &Path) {
@@ -646,6 +932,7 @@ fn snapshot(binary: &str, socket: &Path, harness: &str) -> Value {
     let output = Command::new(binary)
         .arg(harness)
         .env("HARNESS_STATUS_SOCKET", socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
         .output()
         .unwrap();
     assert!(output.status.success());

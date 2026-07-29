@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 
 const HARNESS_STATUS = "harness-status";
 
-type PiStatusEvent = "AgentStart" | "AgentSettled" | "SessionShutdown";
+type PiStatusEvent = "AgentStart" | "AgentSettled" | "Attention" | "SessionShutdown";
 
 function report(event: PiStatusEvent, ctx: ExtensionContext): Promise<void> {
 	return new Promise((resolve) => {
@@ -45,7 +45,18 @@ function report(event: PiStatusEvent, ctx: ExtensionContext): Promise<void> {
 }
 
 export default function (pi: ExtensionAPI) {
+	let context: ExtensionContext | undefined;
+
+	pi.on("session_start", (_event, ctx) => {
+		context = ctx;
+	});
 	pi.on("agent_start", (_event, ctx) => report("AgentStart", ctx));
 	pi.on("agent_settled", (_event, ctx) => report("AgentSettled", ctx));
-	pi.on("session_shutdown", (_event, ctx) => report("SessionShutdown", ctx));
+	pi.events.on("harness-status:attention", () => {
+		if (context) void report("Attention", context);
+	});
+	pi.on("session_shutdown", async (_event, ctx) => {
+		await report("SessionShutdown", ctx);
+		context = undefined;
+	});
 }

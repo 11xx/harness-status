@@ -32,6 +32,17 @@
           }
         ]
       }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "harness-status hook claude",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

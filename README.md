@@ -5,20 +5,21 @@ contract for status bars. The process started with `--follow` owns the live
 registry and keeps a tiny volatile restart checkpoint; there is no database,
 history store, wrapper, or persistent daemon.
 
-The adapters support Codex and Claude Code behind the same CLI and JSON shape.
+The adapters support Codex, Claude Code, and pi behind the same CLI and JSON
+shape.
 
 ## How it works
 
 ```text
-Codex or Claude Code lifecycle event
+Codex, Claude Code, or pi lifecycle event
         |
-        | starts `harness-status hook codex|claude`
+        | starts `harness-status hook codex|claude|pi`
         v
 short-lived hook command
         |
         | non-blocking Unix datagram
         v
-harness-status [codex|claude] --follow
+harness-status [codex|claude|pi] --follow
         |
         | owns the registry, or subscribes to its existing owner
         | JSON object per line for each follower
@@ -48,6 +49,7 @@ cargo build --release
 cargo install --path . --root "$HOME/.local"
 harness-status install codex
 harness-status install claude
+harness-status install pi
 ```
 
 ## Usage
@@ -57,15 +59,18 @@ harness-status install claude
 harness-status
 harness-status codex
 harness-status claude
+harness-status pi
 
 # Own the registry, or subscribe if another follower already owns it.
 harness-status --follow
 harness-status codex --follow
 harness-status claude --follow
+harness-status pi --follow
 
 # Commands used by integrations and status-bar actions.
 harness-status hook codex
 harness-status hook claude
+harness-status hook pi
 harness-status ack 019abc-thread-id
 
 # Add or remove lifecycle callbacks from the harness's user configuration.
@@ -73,6 +78,8 @@ harness-status install codex
 harness-status uninstall codex
 harness-status install claude
 harness-status uninstall claude
+harness-status install pi
+harness-status uninstall pi
 ```
 
 With no harness name, snapshot and follow modes include every supported
@@ -104,15 +111,20 @@ owner election; one restores the runtime checkpoint and the others resubscribe.
 }
 ```
 
-Both adapters intentionally report only states supported cleanly by their
-lifecycle hooks:
+Each adapter reports only states supported cleanly by its lifecycle API:
 
-- `UserPromptSubmit` becomes `working`.
-- `Stop` becomes `completed` and remains visible until acknowledged, reused by
-  another prompt, or its owning harness process exits.
+- Codex and Claude Code `UserPromptSubmit` become `working`, while `Stop`
+  becomes `completed`.
 - Claude Code's `StopFailure` also becomes `completed`: the turn is no longer
   working and needs attention, but the adapter does not expose or retain its
   error details.
+- pi `agent_start` becomes `working`, and `agent_settled` becomes `completed`
+  only after retries, automatic compaction, and queued continuations have
+  finished. `session_shutdown` removes the entry.
+
+A completed entry remains visible until acknowledged, reused by another
+prompt, or its owning harness process exits. Pi also removes it during a clean
+session shutdown.
 
 The hook does not retain prompts, transcript contents, permission details, tool
 arguments, Claude's last response, or stop-failure details. When it can identify
@@ -126,7 +138,10 @@ click-to-ack fallback. Claude Code also omits `Stop` on user interruption, but
 its transcript does not expose Codex's turn-abort record. A Claude working entry
 therefore remains until its next lifecycle event, process exit, or manual
 acknowledgement. Claude's hook input does not include the active model or a turn
-ID, so those optional JSON fields are absent for Claude entries.
+ID, so those optional JSON fields are absent for Claude entries. Pi reports its
+active model but has no separate turn ID in this contract. Pi's
+`agent_settled` event also handles an Esc interruption without transcript
+inspection.
 
 ## Codex hooks
 
@@ -181,6 +196,29 @@ available for manual configuration. See Claude Code's official
 [hooks reference](https://code.claude.com/docs/en/hooks) for the lifecycle and
 input contract.
 
+## pi extension
+
+Install the global lifecycle extension with:
+
+```sh
+harness-status install pi
+```
+
+The command honors `$PI_CODING_AGENT_DIR`, defaults to
+`~/.pi/agent/extensions/harness-status.ts`, and embeds the absolute path to the
+current executable. It refuses to overwrite or remove an unmanaged file at
+that path. Installation and removal are idempotent:
+
+```sh
+harness-status uninstall pi
+```
+
+Run `/reload` in pi sessions that were already open. New sessions discover the
+extension automatically. [`pi/harness-status.ts`](pi/harness-status.ts) is also
+available for a manual PATH-based installation. The extension sends only the
+session ID, working directory, active model ID, lifecycle event, and pi process
+ID; it does not send conversation or tool content.
+
 ## Eww module
 
 Eww has no separate module registry or package format. Reusable widgets are
@@ -206,21 +244,26 @@ Place the exported widget wherever indicators should appear:
 ```yuck
 (harness-status-codex)
 (harness-status-claude)
+(harness-status-pi)
 ```
 
 The module defines no window or bar and assumes no window manager, monitor,
-paths, fonts, or palette. Consumers can theme the semantic classes
+paths, fonts, or consumer palette variables. Consumers can theme the semantic classes
 `.harness-status__indicator--working`,
 `.harness-status__indicator--completed`,
-`.harness-status__indicator--codex`, and
-`.harness-status__indicator--claude`. Working Codex turns use the same
-ten-frame Braille spinner sequence as the Codex terminal title. Working Claude
-turns use Claude Code's Linux pulse sequence (`· ✢ * ✶ ✻ ✽` and back). Both
-animate in Eww rather than in the JSON stream. Completed Codex turns use a
-small dot, while completed Claude turns use Claude Code's static `✻`. Clicking
-either state acknowledges the indicator. These glyph choices live entirely in
-the Eww module; the JSON contract exposes state data rather than presentation
-icons.
+`.harness-status__indicator--codex`,
+`.harness-status__indicator--claude`, and
+`.harness-status__indicator--pi`. Working Codex turns use their ten-frame
+Braille sequence, pi loops `π ϖ π ℼ` at 480 ms per frame, and Claude uses its
+Linux pulse sequence (`· ✢ * ✶ ✻ ✽` and back) at 300 ms per frame. All
+animation stays in Eww
+rather than the JSON stream. Completed Codex turns use a small dot, completed
+Claude turns use Claude Code's static `✻`, and completed pi turns use `π`.
+Clicking any state acknowledges the indicator.
+
+All adapters share the same semantic working/completed color classes, so pi
+stays consistent with the other Eww indicators. Glyph choices live entirely in
+the Eww module; the JSON contract exposes state data rather than presentation.
 
 ## Verification
 

@@ -229,6 +229,62 @@ fn claude_hook_to_jsonl_smoke() {
     wait_for_thread_count(binary, &socket, "claude", 0);
 }
 
+#[test]
+fn pi_extension_to_jsonl_smoke() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-pi-test-{nonce}"));
+    fs::create_dir(&dir).unwrap();
+    let socket = dir.join("status.sock");
+    verify_pi_extension_lifecycle(binary, &dir);
+
+    let child = Command::new(binary)
+        .args(["pi", "--follow"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _follower = Follower {
+        child,
+        dir: dir.clone(),
+    };
+    wait_for_socket(&socket);
+
+    send_hook(binary, &socket, "pi", "AgentStart", None);
+    let working = wait_for_state(binary, &socket, "pi", "working");
+    assert_eq!(working["threads"][0]["id"], "pi-thread-smoke");
+    assert_eq!(working["threads"][0]["harness"], "pi");
+    assert_eq!(working["threads"][0]["name"], "example");
+    assert_eq!(working["threads"][0]["model"], "pi-model-smoke");
+    assert!(working["threads"][0].get("turn_id").is_none());
+    let checkpoint = fs::read_to_string(state_path(&socket)).unwrap();
+    assert!(!checkpoint.contains("not retained"));
+
+    send_hook(binary, &socket, "pi", "AgentSettled", None);
+    wait_for_state(binary, &socket, "pi", "completed");
+    send_hook(binary, &socket, "pi", "AgentStart", None);
+    wait_for_state(binary, &socket, "pi", "working");
+    send_hook(binary, &socket, "pi", "SessionShutdown", None);
+    wait_for_thread_count(binary, &socket, "pi", 0);
+
+    let mut pi_owner = Command::new("sleep").arg("30").spawn().unwrap();
+    send_hook_with_owner(
+        binary,
+        &socket,
+        "pi",
+        "AgentStart",
+        None,
+        Some(pi_owner.id()),
+    );
+    wait_for_state(binary, &socket, "pi", "working");
+    pi_owner.kill().unwrap();
+    pi_owner.wait().unwrap();
+    wait_for_thread_count(binary, &socket, "pi", 0);
+}
+
 fn verify_codex_hook_lifecycle(binary: &str, dir: &Path) {
     let codex_home = dir.join("codex-home");
     fs::create_dir(&codex_home).unwrap();
@@ -419,12 +475,84 @@ fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {
     assert_eq!(fs::read(&settings_path).unwrap(), uninstalled_bytes);
 }
 
+fn verify_pi_extension_lifecycle(binary: &str, dir: &Path) {
+    let pi_agent_dir = dir.join("pi-agent");
+    let extension_path = pi_agent_dir.join("extensions/harness-status.ts");
+
+    let install = Command::new(binary)
+        .args(["install", "pi"])
+        .env("PI_CODING_AGENT_DIR", &pi_agent_dir)
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+    let installed_bytes = fs::read(&extension_path).unwrap();
+    let installed = String::from_utf8(installed_bytes.clone()).unwrap();
+    assert!(installed.starts_with("// Managed by harness-status."));
+    assert!(installed.contains(binary));
+    assert!(installed.contains("agent_start"));
+    assert!(installed.contains("agent_settled"));
+    assert!(installed.contains("session_shutdown"));
+    assert_eq!(
+        fs::metadata(&extension_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let reinstall = Command::new(binary)
+        .args(["install", "pi"])
+        .env("PI_CODING_AGENT_DIR", &pi_agent_dir)
+        .output()
+        .unwrap();
+    assert!(reinstall.status.success());
+    assert_eq!(fs::read(&extension_path).unwrap(), installed_bytes);
+
+    let uninstall = Command::new(binary)
+        .args(["uninstall", "pi"])
+        .env("PI_CODING_AGENT_DIR", &pi_agent_dir)
+        .output()
+        .unwrap();
+    assert!(uninstall.status.success());
+    assert!(!extension_path.exists());
+
+    let reuninstall = Command::new(binary)
+        .args(["uninstall", "pi"])
+        .env("PI_CODING_AGENT_DIR", &pi_agent_dir)
+        .output()
+        .unwrap();
+    assert!(reuninstall.status.success());
+
+    fs::create_dir_all(extension_path.parent().unwrap()).unwrap();
+    fs::write(&extension_path, "// user-owned extension\n").unwrap();
+    let refused = Command::new(binary)
+        .args(["install", "pi"])
+        .env("PI_CODING_AGENT_DIR", &pi_agent_dir)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert_eq!(
+        fs::read_to_string(&extension_path).unwrap(),
+        "// user-owned extension\n"
+    );
+    fs::remove_file(extension_path).unwrap();
+}
+
 fn send_hook(
     binary: &str,
     socket: &Path,
     harness: &str,
     event: &str,
     transcript_path: Option<&Path>,
+) {
+    let owner_pid = (harness == "pi").then_some(std::process::id());
+    send_hook_with_owner(binary, socket, harness, event, transcript_path, owner_pid);
+}
+
+fn send_hook_with_owner(
+    binary: &str,
+    socket: &Path,
+    harness: &str,
+    event: &str,
+    transcript_path: Option<&Path>,
+    owner_pid: Option<u32>,
 ) {
     let mut child = Command::new(binary)
         .args(["hook", harness])
@@ -435,6 +563,7 @@ fn send_hook(
     let session_id = match harness {
         "codex" => "thread-smoke",
         "claude" => "claude-thread-smoke",
+        "pi" => "pi-thread-smoke",
         _ => panic!("unsupported test harness {harness}"),
     };
     let mut input = json!({
@@ -448,6 +577,11 @@ fn send_hook(
     if harness == "codex" {
         input["turn_id"] = json!("turn-smoke");
         input["model"] = json!("gpt-smoke");
+    } else if harness == "pi" {
+        input["model"] = json!("pi-model-smoke");
+    }
+    if let Some(owner_pid) = owner_pid {
+        input["owner_pid"] = json!(owner_pid);
     }
     serde_json::to_writer(child.stdin.take().unwrap(), &input).unwrap();
     assert!(child.wait().unwrap().success());

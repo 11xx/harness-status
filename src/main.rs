@@ -19,6 +19,10 @@ const CODEX_HOOK_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
 const CLAUDE_HOOK_EVENTS: [&str; 3] = ["UserPromptSubmit", "Stop", "StopFailure"];
 const LEGACY_CODEX_HOOK_COMMAND: &str = "harness-status hook codex";
 const LEGACY_CLAUDE_HOOK_COMMAND: &str = "harness-status hook claude";
+const PI_EXTENSION_FILE: &str = "harness-status.ts";
+const PI_EXTENSION_MARKER: &str =
+    "// Managed by harness-status. Reinstall instead of editing this file.\n";
+const PI_EXTENSION_SOURCE: &str = include_str!("../pi/harness-status.ts");
 
 #[derive(Debug)]
 enum Action {
@@ -50,6 +54,8 @@ struct HarnessHookInput {
     cwd: String,
     #[serde(default)]
     model: String,
+    #[serde(default)]
+    owner_pid: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -163,10 +169,18 @@ impl Registry {
             cwd,
             model,
         } = event;
+        if harness == "pi" && event == "SessionShutdown" {
+            let before = self.entries.len();
+            self.entries
+                .retain(|entry| entry.status.harness != harness || entry.status.id != session_id);
+            return before != self.entries.len();
+        }
+
         let state = match (harness, event.as_str()) {
-            ("codex" | "claude", "UserPromptSubmit") => "working",
-            ("codex" | "claude", "Stop") => "completed",
-            ("claude", "StopFailure") => "completed",
+            ("codex" | "claude", "UserPromptSubmit") | ("pi", "AgentStart") => "working",
+            ("codex" | "claude", "Stop") | ("claude", "StopFailure") | ("pi", "AgentSettled") => {
+                "completed"
+            }
             _ => return false,
         };
 
@@ -405,6 +419,7 @@ fn install_integration(harness: &str) -> io::Result<()> {
             &CLAUDE_HOOK_EVENTS,
             LEGACY_CLAUDE_HOOK_COMMAND,
         ),
+        "pi" => install_pi_extension(),
         _ => Err(unsupported_harness(harness)),
     }
 }
@@ -425,6 +440,7 @@ fn uninstall_integration(harness: &str) -> io::Result<()> {
             &CLAUDE_HOOK_EVENTS,
             LEGACY_CLAUDE_HOOK_COMMAND,
         ),
+        "pi" => uninstall_pi_extension(),
         _ => Err(unsupported_harness(harness)),
     }
 }
@@ -573,6 +589,98 @@ fn claude_settings_path() -> io::Result<PathBuf> {
             )
         })?;
     Ok(PathBuf::from(home).join(".claude/settings.json"))
+}
+
+fn pi_agent_dir() -> io::Result<PathBuf> {
+    if let Some(agent_dir) = env::var_os("PI_CODING_AGENT_DIR").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(agent_dir));
+    }
+    let home = env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "neither PI_CODING_AGENT_DIR nor HOME is set",
+            )
+        })?;
+    Ok(PathBuf::from(home).join(".pi/agent"))
+}
+
+fn pi_extension_path() -> io::Result<PathBuf> {
+    Ok(pi_agent_dir()?.join("extensions").join(PI_EXTENSION_FILE))
+}
+
+fn installed_pi_extension() -> io::Result<Vec<u8>> {
+    let executable = env::current_exe()?;
+    let executable = executable.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "harness-status executable path is not valid UTF-8",
+        )
+    })?;
+    let executable = serde_json::to_string(executable).map_err(io::Error::other)?;
+    let source = PI_EXTENSION_SOURCE.replacen(
+        "const HARNESS_STATUS = \"harness-status\";",
+        &format!("const HARNESS_STATUS = {executable};"),
+        1,
+    );
+    Ok(format!("{PI_EXTENSION_MARKER}{source}").into_bytes())
+}
+
+fn install_pi_extension() -> io::Result<()> {
+    let path = pi_extension_path()?;
+    let target = installed_pi_extension()?;
+    match fs::read(&path) {
+        Ok(current) if current == target => {
+            println!("pi extension is already installed in {}.", path.display());
+            return Ok(());
+        }
+        Ok(current) if !current.starts_with(PI_EXTENSION_MARKER.as_bytes()) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "cannot replace unmanaged pi extension {}; move it first",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    write_bytes_atomic(&path, &target, ".harness-status-pi-extension")?;
+    println!("Installed pi extension in {}.", path.display());
+    println!("Run /reload in pi sessions that are already open.");
+    Ok(())
+}
+
+fn uninstall_pi_extension() -> io::Result<()> {
+    let path = pi_extension_path()?;
+    match fs::read(&path) {
+        Ok(current) if current.starts_with(PI_EXTENSION_MARKER.as_bytes()) => {
+            fs::remove_file(&path)?;
+            println!("Uninstalled pi extension from {}.", path.display());
+            println!("Run /reload in pi sessions that are already open.");
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "refusing to remove unmanaged pi extension {}",
+                    path.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            println!(
+                "pi extension is already uninstalled from {}.",
+                path.display()
+            );
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(())
 }
 
 fn writable_config_path(path: &Path) -> io::Result<PathBuf> {
@@ -724,10 +832,16 @@ fn invalid_hook_config(path: &Path, detail: &str) -> io::Error {
 }
 
 fn write_json_atomic(path: &Path, document: &Value) -> io::Result<()> {
+    let mut contents = serde_json::to_vec_pretty(document).map_err(io::Error::other)?;
+    contents.push(b'\n');
+    write_bytes_atomic(path, &contents, ".hooks.json.harness-status")
+}
+
+fn write_bytes_atomic(path: &Path, contents: &[u8], prefix: &str) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "hook path has no parent directory",
+            "configuration path has no parent directory",
         )
     })?;
     fs::create_dir_all(parent)?;
@@ -736,15 +850,10 @@ fn write_json_atomic(path: &Path, document: &Value) -> io::Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let temporary = parent.join(format!(
-        ".hooks.json.harness-status-{}-{nonce}",
-        process::id()
-    ));
+    let temporary = parent.join(format!("{prefix}-{}-{nonce}", process::id()));
     let permissions = fs::metadata(path)
         .map(|metadata| metadata.permissions().mode() & 0o777)
         .unwrap_or(0o600);
-    let mut contents = serde_json::to_vec_pretty(document).map_err(io::Error::other)?;
-    contents.push(b'\n');
 
     let result = (|| {
         let mut file = fs::OpenOptions::new()
@@ -752,7 +861,7 @@ fn write_json_atomic(path: &Path, document: &Value) -> io::Result<()> {
             .create_new(true)
             .open(&temporary)?;
         fs::set_permissions(&temporary, fs::Permissions::from_mode(permissions))?;
-        file.write_all(&contents)?;
+        file.write_all(contents)?;
         file.sync_all()?;
         fs::rename(&temporary, path)
     })();
@@ -1083,37 +1192,41 @@ fn publish_subscribers(
 }
 
 fn send_hook(harness: &str) {
-    let event = match harness {
-        "codex" | "claude" => serde_json::from_reader::<_, HarnessHookInput>(io::stdin().lock())
-            .map(|input| {
-                let transcript = (harness == "codex")
-                    .then_some(input.transcript_path)
-                    .flatten()
-                    .map(|path| TranscriptCursor {
-                        offset: fs::metadata(&path)
-                            .map(|metadata| metadata.len())
-                            .unwrap_or(0),
-                        path,
-                    });
-                HookEvent {
-                    event: input.hook_event_name,
-                    session_id: input.session_id,
-                    turn_id: input.turn_id,
-                    transcript,
-                    cwd: input.cwd,
-                    model: input.model,
-                }
-            }),
+    let input = match harness {
+        "codex" | "claude" | "pi" => {
+            serde_json::from_reader::<_, HarnessHookInput>(io::stdin().lock())
+        }
         _ => return,
     };
-    let Ok(event) = event else {
+    let Ok(input) = input else {
         return;
+    };
+    let transcript = (harness == "codex")
+        .then_some(input.transcript_path)
+        .flatten()
+        .map(|path| TranscriptCursor {
+            offset: fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            path,
+        });
+    let owner = input
+        .owner_pid
+        .and_then(owner_for_pid)
+        .or_else(|| find_harness_owner(harness));
+    let event = HookEvent {
+        event: input.hook_event_name,
+        session_id: input.session_id,
+        turn_id: input.turn_id,
+        transcript,
+        cwd: input.cwd,
+        model: input.model,
     };
 
     let request = Request::Hook {
         harness: harness.to_owned(),
         event,
-        owner: find_harness_owner(harness),
+        owner,
     };
     send_fire_and_forget(&request);
 }
@@ -1232,6 +1345,13 @@ fn current_uid() -> Option<String> {
     let status = fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|line| line.starts_with("Uid:"))?;
     line.split_ascii_whitespace().nth(1).map(str::to_owned)
+}
+
+fn owner_for_pid(pid: u32) -> Option<Owner> {
+    Some(Owner {
+        pid,
+        start_ticks: read_process(pid)?.start_ticks,
+    })
 }
 
 fn find_harness_owner(harness: &str) -> Option<Owner> {

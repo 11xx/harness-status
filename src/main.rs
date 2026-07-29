@@ -261,13 +261,14 @@ impl Registry {
             };
         }
 
+        let notify_transition = !matches!((harness, event.as_str()), ("pi", "ResumeCompleted"));
         let state = match (harness, event.as_str()) {
             ("claude", "SessionStart")
             | ("codex" | "claude", "UserPromptSubmit")
-            | ("pi", "AgentStart") => "working",
-            ("codex" | "claude", "Stop") | ("claude", "StopFailure") | ("pi", "AgentSettled") => {
-                "completed"
-            }
+            | ("pi", "AgentStart" | "ResumeWorking") => "working",
+            ("codex" | "claude", "Stop")
+            | ("claude", "StopFailure")
+            | ("pi", "AgentSettled" | "ResumeCompleted") => "completed",
             ("pi", "Attention") => "attention",
             ("claude", "Notification")
                 if matches!(
@@ -313,13 +314,12 @@ impl Registry {
                 entry.transcript = transcript;
             }
             let notification =
-                (transitioned && matches!(state, "completed" | "attention")).then(|| {
-                    Notification {
+                (transitioned && notify_transition && matches!(state, "completed" | "attention"))
+                    .then(|| Notification {
                         harness: harness.to_owned(),
                         project: entry.status.name.clone(),
                         state: state.to_owned(),
-                    }
-                });
+                    });
             return HookResult {
                 changed: true,
                 notification,
@@ -340,11 +340,16 @@ impl Registry {
             owner,
             transcript,
         });
-        let notification = matches!(state, "completed" | "attention").then(|| Notification {
-            harness: harness.to_owned(),
-            project: display_name(&self.entries.last().expect("entry was inserted").status.cwd),
-            state: state.to_owned(),
-        });
+        let notification =
+            (notify_transition && matches!(state, "completed" | "attention")).then(|| {
+                Notification {
+                    harness: harness.to_owned(),
+                    project: display_name(
+                        &self.entries.last().expect("entry was inserted").status.cwd,
+                    ),
+                    state: state.to_owned(),
+                }
+            });
         HookResult {
             changed: true,
             notification,
@@ -1625,5 +1630,24 @@ mod tests {
         assert!(!ignored.changed);
         assert!(ignored.notification.is_none());
         assert_eq!(registry.entries[0].status.state, "attention");
+    }
+
+    #[test]
+    fn pi_attention_resume_restores_state_without_a_second_notification() {
+        let mut registry = Registry::default();
+
+        let working = registry.apply_hook("pi", event("AgentStart", None), None);
+        assert!(working.notification.is_none());
+        let attention = registry.apply_hook("pi", event("Attention", None), None);
+        assert_eq!(attention.notification.unwrap().state, "attention");
+        let resumed_working = registry.apply_hook("pi", event("ResumeWorking", None), None);
+        assert!(resumed_working.notification.is_none());
+        assert_eq!(registry.entries[0].status.state, "working");
+
+        let attention = registry.apply_hook("pi", event("Attention", None), None);
+        assert_eq!(attention.notification.unwrap().state, "attention");
+        let resumed_completed = registry.apply_hook("pi", event("ResumeCompleted", None), None);
+        assert!(resumed_completed.notification.is_none());
+        assert_eq!(registry.entries[0].status.state, "completed");
     }
 }

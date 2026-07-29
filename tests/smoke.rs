@@ -415,7 +415,11 @@ fn pi_extension_to_jsonl_smoke() {
     wait_for_state(binary, &socket, "pi", "completed");
     send_hook(binary, &socket, "pi", "Attention", None);
     wait_for_state(binary, &socket, "pi", "attention");
-    send_hook(binary, &socket, "pi", "AgentStart", None);
+    send_hook(binary, &socket, "pi", "ResumeCompleted", None);
+    wait_for_state(binary, &socket, "pi", "completed");
+    send_hook(binary, &socket, "pi", "Attention", None);
+    wait_for_state(binary, &socket, "pi", "attention");
+    send_hook(binary, &socket, "pi", "ResumeWorking", None);
     wait_for_state(binary, &socket, "pi", "working");
     send_hook(binary, &socket, "pi", "SessionShutdown", None);
     wait_for_thread_count(binary, &socket, "pi", 0);
@@ -650,7 +654,10 @@ fn verify_pi_extension_lifecycle(binary: &str, dir: &Path) {
     assert!(installed.contains("session_shutdown"));
     assert!(installed.contains("session_start"));
     assert!(installed.contains("harness-status:attention"));
+    assert!(installed.contains("harness-status:resume"));
     assert!(installed.contains("Attention"));
+    assert!(installed.contains("ResumeWorking"));
+    assert!(installed.contains("ResumeCompleted"));
     assert_eq!(
         fs::metadata(&extension_path).unwrap().permissions().mode() & 0o777,
         0o600

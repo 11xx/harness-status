@@ -123,6 +123,8 @@ The `state` field is `working`, `completed`, or `attention`:
 - pi `agent_start` becomes `working`, `agent_settled` becomes `completed` only
   after retries, automatic compaction, and queued continuations have finished,
   and the extension event `harness-status:attention` becomes `attention`.
+  Cooperating extensions emit `harness-status:resume` with only a validated
+  `working` or `completed` state after their interaction closes.
   `session_shutdown` removes the entry.
 
 A completed or attention entry remains visible until acknowledged, reused by
@@ -135,9 +137,10 @@ arguments contain only the harness display name, project display name, and
 `finished` or `needs attention`; they never contain working directories, model
 or session identifiers, prompts, responses, tools, or permission details.
 
-Only the registry owner sends a desktop notification, and only on a transition
-into `completed` or `attention`. It invokes `notify-send` directly without a
-shell. Set `HARNESS_STATUS_NOTIFY=0`, `false`, or `off` to disable notifications,
+Only the registry owner sends a desktop notification, and only on a lifecycle
+transition into `completed` or `attention`. Resolving a reported interaction
+restores its prior semantic state without sending a second notification. The
+owner invokes `notify-send` directly without a shell. Set `HARNESS_STATUS_NOTIFY=0`, `false`, or `off` to disable notifications,
 or set `HARNESS_STATUS_NOTIFY_COMMAND` to override the executable. A missing,
 failing, or slow notifier does not affect status publication; notifier processes
 are reaped asynchronously and killed after one second. Delivery is best-effort:

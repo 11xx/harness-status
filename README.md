@@ -39,7 +39,9 @@ The socket is an ephemeral IPC endpoint at
 metadata to a mode-0600 `.state.json` file beside the socket. A replacement
 owner restores live entries before printing its first snapshot and removes any
 whose recorded process identity is no longer alive. The runtime directory and
-checkpoint disappear at logout or reboot.
+checkpoint disappear at logout or reboot. Owner election and follower startup
+also remove client socket paths whose encoded PID no longer exists, so status
+bar reloads cannot accumulate abandoned Unix sockets.
 
 ## Build and install
 
@@ -144,7 +146,10 @@ interaction is required or a top-level harness fully settles. Delegated child
 completion is recorded but does not notify; its parent remains working until it
 processes every child result and later settles. Resolving a reported interaction
 restores its prior semantic state without sending a second notification. The
-owner invokes `notify-send` directly without a shell. Set `HARNESS_STATUS_NOTIFY=0`, `false`, or `off` to disable notifications,
+owner invokes `notify-send` directly without a shell and assigns a distinct
+application identity to Codex, Claude Code, and pi, preventing a new event from
+surfacing another harness's older grouped notifications. Set
+`HARNESS_STATUS_NOTIFY=0`, `false`, or `off` to disable notifications,
 or set `HARNESS_STATUS_NOTIFY_COMMAND` to override the executable. A missing,
 failing, or slow notifier does not affect status publication; notifier processes
 are reaped asynchronously and killed after one second. Delivery is best-effort:
@@ -164,6 +169,11 @@ ID, so those optional JSON fields are absent for Claude entries. Pi reports its
 active model but has no separate turn ID in this contract. Pi's
 `agent_settled` event also handles an Esc interruption without transcript
 inspection.
+
+Codex generates local memories in background sessions rooted beneath
+`$CODEX_HOME/memories` (normally `~/.codex/memories`). Those internal sessions
+are excluded at the hook boundary: they do not enter the user-facing registry,
+appear in Eww, or emit task-completion notifications.
 
 ## Codex hooks
 

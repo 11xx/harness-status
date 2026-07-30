@@ -45,6 +45,8 @@ fn codex_hook_to_jsonl_smoke() {
         dir: dir.clone(),
     };
     wait_for_socket(&socket);
+    send_internal_codex_hook(binary, &socket, &dir.join("codex-home"));
+    wait_for_thread_count(binary, &socket, "codex", 0);
     let state_path = state_path(&socket);
     wait_for_path(&state_path);
     assert_eq!(
@@ -280,12 +282,16 @@ fn desktop_notifications_are_generic_and_transition_only() {
     wait_for_state(binary, &socket, "claude", "completed");
     send_notification_hook(binary, &socket, "Notification", Some("permission_prompt"));
     wait_for_state(binary, &socket, "claude", "attention");
-    let lines = wait_for_lines(&output, 4);
+    let lines = wait_for_lines(&output, 8);
     assert_eq!(
         lines,
         [
+            "--app-name",
+            "harness-status-claude",
             "Claude Code",
             "example finished",
+            "--app-name",
+            "harness-status-claude",
             "Claude Code",
             "example needs attention"
         ]
@@ -712,6 +718,29 @@ fn send_hook(
 ) {
     let owner_pid = (harness == "pi").then_some(std::process::id());
     send_hook_with_owner(binary, socket, harness, event, transcript_path, owner_pid);
+}
+
+fn send_internal_codex_hook(binary: &str, socket: &Path, codex_home: &Path) {
+    let mut child = Command::new(binary)
+        .args(["hook", "codex"])
+        .env("CODEX_HOME", codex_home)
+        .env("HARNESS_STATUS_SOCKET", socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        child.stdin.take().unwrap(),
+        &json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "internal-memory-thread",
+            "turn_id": "internal-memory-turn",
+            "cwd": codex_home.join("memories"),
+            "model": "gpt-memory"
+        }),
+    )
+    .unwrap();
+    assert!(child.wait().unwrap().success());
 }
 
 fn send_hook_with_owner(

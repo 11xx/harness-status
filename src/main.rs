@@ -194,8 +194,9 @@ impl Notifier {
             "finished"
         };
         let body = format!("{} {action}", notification.project);
+        let app_name = notification_app_name(&notification.harness);
         let child = Command::new(command)
-            .args([title, body])
+            .args(["--app-name", &app_name, &title, &body])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1048,6 +1049,7 @@ fn follow_as_owner(
     };
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     socket.set_read_timeout(Some(REAP_INTERVAL))?;
+    cleanup_stale_client_sockets(path)?;
 
     let state_path = registry_state_path(path);
     let notifier = Notifier::from_env();
@@ -1131,6 +1133,7 @@ fn follow_existing(
     harness: Option<&str>,
     last_json: &mut Option<String>,
 ) -> io::Result<()> {
+    cleanup_stale_client_sockets(server_path)?;
     let client_path = client_socket_path(server_path, "follow");
     let _ = fs::remove_file(&client_path);
     let socket = UnixDatagram::bind(&client_path)?;
@@ -1342,6 +1345,11 @@ fn send_hook(harness: &str) {
     let Ok(input) = input else {
         return;
     };
+    if harness == "codex"
+        && codex_state_root().is_some_and(|root| is_internal_codex_cwd(&input.cwd, &root))
+    {
+        return;
+    }
     let transcript = (harness == "codex")
         .then_some(input.transcript_path)
         .flatten()
@@ -1484,6 +1492,37 @@ fn client_socket_path(server_path: &Path, purpose: &str) -> PathBuf {
         .join(name)
 }
 
+fn client_socket_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(".harness-status-")?;
+    let rest = rest
+        .strip_prefix("follow-")
+        .or_else(|| rest.strip_prefix("query-"))?;
+    rest.split_once('-')?.0.parse().ok()
+}
+
+fn cleanup_stale_client_sockets(server_path: &Path) -> io::Result<usize> {
+    let parent = server_path.parent().unwrap_or_else(|| Path::new("/tmp"));
+    let mut removed = 0;
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(pid) = client_socket_pid(&name) else {
+            continue;
+        };
+        if read_process(pid).is_some() {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
+}
+
 fn current_uid() -> Option<String> {
     let status = fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|line| line.starts_with("Uid:"))?;
@@ -1546,6 +1585,20 @@ fn process_matches_owner(owner: &Owner) -> bool {
 fn delegated_process() -> bool {
     env::var("HARNESS_STATUS_DELEGATED")
         .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+}
+
+fn codex_state_root() -> Option<PathBuf> {
+    env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+}
+
+fn is_internal_codex_cwd(cwd: &str, state_root: &Path) -> bool {
+    Path::new(cwd).starts_with(state_root.join("memories"))
+}
+
+fn notification_app_name(harness: &str) -> String {
+    format!("harness-status-{harness}")
 }
 
 fn harness_display_name(harness: &str) -> &str {
@@ -1688,5 +1741,47 @@ mod tests {
         let resumed_completed = registry.apply_hook("pi", event("ResumeCompleted", None), None);
         assert!(resumed_completed.notification.is_none());
         assert_eq!(registry.entries[0].status.state, "completed");
+    }
+
+    #[test]
+    fn internal_codex_memory_work_is_outside_the_user_facing_registry() {
+        let root = Path::new("/home/test/.codex");
+        assert!(is_internal_codex_cwd("/home/test/.codex/memories", root));
+        assert!(is_internal_codex_cwd(
+            "/home/test/.codex/memories/work",
+            root
+        ));
+        assert!(!is_internal_codex_cwd("/home/test/code/memories", root));
+    }
+
+    #[test]
+    fn notification_groups_are_distinct_per_harness() {
+        assert_eq!(notification_app_name("codex"), "harness-status-codex");
+        assert_eq!(notification_app_name("claude"), "harness-status-claude");
+        assert_eq!(notification_app_name("pi"), "harness-status-pi");
+    }
+
+    #[test]
+    fn stale_client_socket_cleanup_preserves_live_pid_paths() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            env::temp_dir().join(format!("harness-status-sockets-{}-{nonce}", process::id()));
+        fs::create_dir(&root).unwrap();
+        let server = root.join("harness-status.sock");
+        let dead = root.join(".harness-status-follow-2147483647-1.sock");
+        let live = root.join(format!(".harness-status-follow-{}-2.sock", process::id()));
+        drop(UnixDatagram::bind(&dead).unwrap());
+        let live_socket = UnixDatagram::bind(&live).unwrap();
+
+        assert_eq!(cleanup_stale_client_sockets(&server).unwrap(), 1);
+        assert!(!dead.exists());
+        assert!(live.exists());
+
+        drop(live_socket);
+        fs::remove_file(live).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 }

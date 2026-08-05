@@ -7,3 +7,18 @@
   background: transparent;
   border: 0;
 }
+
+.harness-status__thread {
+  padding: 0;
+}
+
+/* A thread that settled a while ago is still there, just no longer news. */
+.harness-status__indicator--idle {
+  opacity: 0.45;
+}
+
+.harness-status__background {
+  padding: 0 2px 0 0;
+  opacity: 0.55;
+  font-size: 0.8em;
+}

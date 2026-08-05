@@ -15,6 +15,7 @@ const MAX_DATAGRAM_SIZE: usize = 64 * 1024;
 const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const REAP_INTERVAL: Duration = Duration::from_millis(500);
 const SUBSCRIBER_HEARTBEAT: Duration = Duration::from_secs(2);
+const IDLE_AFTER_SECONDS: u64 = 300;
 const STATE_VERSION: u32 = 1;
 const CODEX_HOOK_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
 const CODEX_RETIRED_HOOK_EVENTS: [&str; 0] = [];
@@ -72,6 +73,10 @@ struct HarnessHookInput {
     notification_type: Option<String>,
     #[serde(default)]
     delegated: bool,
+    #[serde(default)]
+    background_tasks: Vec<Value>,
+    #[serde(default)]
+    session_crons: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -85,6 +90,8 @@ struct HookEvent {
     notification_type: Option<String>,
     #[serde(default)]
     delegated: bool,
+    #[serde(default)]
+    background: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -182,7 +189,20 @@ struct ThreadStatus {
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     turn_id: Option<String>,
+    /// Why the thread wants the user, for states that need a reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// The thread stopped answering with its own work still running.
+    #[serde(default, skip_serializing_if = "is_false")]
+    background: bool,
+    /// When the current turn began, so a bar can show how long it has run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_at: Option<u64>,
     updated_at: u64,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -213,6 +233,7 @@ struct Notification {
     harness: String,
     project: String,
     state: String,
+    reason: Option<String>,
 }
 
 struct Notifier {
@@ -235,10 +256,10 @@ impl Notifier {
             return;
         };
         let title = harness_display_name(&notification.harness).to_owned();
-        let action = if notification.state == "attention" {
-            "needs attention"
-        } else {
-            "finished"
+        let action = match (notification.state.as_str(), notification.reason.as_deref()) {
+            ("attention", Some(reason)) => format!("needs attention: {reason}"),
+            ("attention", None) => "needs attention".to_owned(),
+            _ => "finished".to_owned(),
         };
         let body = format!("{} {action}", notification.project);
         let app_name = notification_app_name(&notification.harness);
@@ -303,6 +324,7 @@ impl Registry {
             model,
             notification_type,
             delegated,
+            background,
         } = event;
         if matches!(
             (harness, event.as_str()),
@@ -317,30 +339,48 @@ impl Registry {
             };
         }
 
-        let state = match (harness, event.as_str()) {
+        // A settled thread reports that it is waiting only for the session it
+        // already belongs to; it never announces one.
+        if harness == "claude" && notification_type.as_deref() == Some("idle_prompt") {
+            let settled = self.entries.iter_mut().find(|entry| {
+                entry.status.harness == harness
+                    && entry.status.id == session_id
+                    && entry.status.state == "completed"
+            });
+            let Some(entry) = settled else {
+                return HookResult {
+                    changed: false,
+                    notification: None,
+                };
+            };
+            entry.status.state = "idle".to_owned();
+            return HookResult {
+                changed: true,
+                notification: None,
+            };
+        }
+
+        let (state, reason) = match (harness, event.as_str()) {
             ("codex" | "claude", "UserPromptSubmit") | ("pi", "AgentStart" | "ResumeWorking") => {
-                "working"
+                ("working", None)
             }
             ("codex" | "claude", "Stop") | ("pi", "AgentSettled" | "ResumeCompleted") => {
-                "completed"
+                ("completed", None)
             }
-            ("claude", "StopFailure") | ("pi", "Attention") => "attention",
-            ("claude", "Notification")
-                if matches!(
-                    notification_type.as_deref(),
-                    Some("permission_prompt" | "elicitation_dialog" | "agent_needs_input")
-                ) =>
-            {
-                "attention"
-            }
-            ("claude", "Notification")
-                if matches!(
-                    notification_type.as_deref(),
-                    Some("elicitation_complete" | "elicitation_response")
-                ) =>
-            {
-                "working"
-            }
+            ("claude", "StopFailure") => ("attention", Some("failure")),
+            ("pi", "Attention") => ("attention", None),
+            ("claude", "Notification") => match notification_type.as_deref() {
+                Some("permission_prompt") => ("attention", Some("permission")),
+                Some("elicitation_dialog") => ("attention", Some("elicitation")),
+                Some("agent_needs_input") => ("attention", Some("subagent")),
+                Some("elicitation_complete" | "elicitation_response") => ("working", None),
+                _ => {
+                    return HookResult {
+                        changed: false,
+                        notification: None,
+                    };
+                }
+            },
             _ => {
                 return HookResult {
                     changed: false,
@@ -370,7 +410,16 @@ impl Registry {
             if model.is_some() {
                 entry.status.model = model;
             }
-            entry.status.turn_id = turn_id;
+            // Events that carry no turn identity leave the running turn's
+            // alone, so interrupt detection survives an interaction.
+            if turn_id.is_some() {
+                entry.status.turn_id = turn_id;
+            }
+            entry.status.reason = reason.map(str::to_owned);
+            entry.status.background = background;
+            if starts_turn {
+                entry.status.started_at = Some(now);
+            }
             entry.status.updated_at = now;
             if starts_turn || owner.is_some() {
                 entry.owner = owner;
@@ -384,6 +433,7 @@ impl Registry {
                         harness: harness.to_owned(),
                         project: entry.status.name.clone(),
                         state: state.to_owned(),
+                        reason: reason.map(str::to_owned),
                     });
             return HookResult {
                 changed: true,
@@ -400,6 +450,9 @@ impl Registry {
                 name,
                 model,
                 turn_id,
+                reason: reason.map(str::to_owned),
+                background,
+                started_at: starts_turn.then_some(now),
                 updated_at: now,
             },
             owner,
@@ -413,6 +466,7 @@ impl Registry {
                         &self.entries.last().expect("entry was inserted").status.cwd,
                     ),
                     state: state.to_owned(),
+                    reason: reason.map(str::to_owned),
                 }
             });
         HookResult {
@@ -425,6 +479,23 @@ impl Registry {
         let before = self.entries.len();
         self.entries.retain(|entry| entry.status.id != id);
         before != self.entries.len()
+    }
+
+    /// A thread that settled long ago is still waiting for the user, but it is
+    /// no longer news. Claude reports its own idle threshold; every harness
+    /// reaches the same state by sitting still.
+    fn settle_quiet_entries(&mut self) -> bool {
+        let now = unix_time_seconds();
+        let mut changed = false;
+        for entry in &mut self.entries {
+            if entry.status.state == "completed"
+                && now.saturating_sub(entry.status.updated_at) >= IDLE_AFTER_SECONDS
+            {
+                entry.status.state = "idle".to_owned();
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn reap_dead_owners(&mut self) -> bool {
@@ -464,12 +535,17 @@ impl Registry {
     }
 
     fn snapshot_json(&self, harness: Option<&str>) -> String {
-        let threads = self
+        // Indicator order follows the threads themselves, not the order their
+        // events happened to arrive, so a dot keeps its place in the bar.
+        let mut threads: Vec<&ThreadStatus> = self
             .entries
             .iter()
             .filter(|entry| harness.is_none_or(|name| entry.status.harness == name))
             .map(|entry| &entry.status)
             .collect();
+        threads.sort_unstable_by(|left, right| {
+            (&left.harness, &left.name, &left.id).cmp(&(&right.harness, &right.name, &right.id))
+        });
         serde_json::to_string(&Snapshot { threads }).expect("serializing status cannot fail")
     }
 }
@@ -1216,6 +1292,7 @@ fn follow_as_owner(
         }
 
         changed |= registry.follow_running_transcripts();
+        changed |= registry.settle_quiet_entries();
         changed |= registry.reap_dead_owners();
         if changed {
             checkpoint_registry(&state_path, &registry);
@@ -1490,6 +1567,7 @@ fn send_hook(harness: &str) {
         model: input.model,
         notification_type: input.notification_type,
         delegated: input.delegated || delegated_process(),
+        background: !input.background_tasks.is_empty() || !input.session_crons.is_empty(),
     };
 
     let request = Request::Hook {
@@ -1791,6 +1869,7 @@ mod tests {
             model: String::new(),
             notification_type: notification_type.map(str::to_owned),
             delegated,
+            background: false,
         }
     }
 
@@ -1846,6 +1925,105 @@ mod tests {
         assert!(ended.changed);
         assert!(ended.notification.is_none());
         assert!(registry.entries.is_empty());
+    }
+
+    #[test]
+    fn a_settled_thread_goes_quiet_without_announcing_itself() {
+        let mut registry = Registry::default();
+        registry.apply_hook("claude", event("UserPromptSubmit", None), None);
+        registry.apply_hook("claude", event("Stop", None), None);
+
+        // A thread that just finished is still news.
+        assert!(!registry.settle_quiet_entries());
+        assert_eq!(registry.entries[0].status.state, "completed");
+
+        let idle = registry.apply_hook("claude", event("Notification", Some("idle_prompt")), None);
+        assert!(idle.changed);
+        assert!(idle.notification.is_none());
+        assert_eq!(registry.entries[0].status.state, "idle");
+
+        // Waiting is not attention: an idle report never creates a thread, and
+        // never demotes one that is working.
+        registry.entries.clear();
+        let unknown =
+            registry.apply_hook("claude", event("Notification", Some("idle_prompt")), None);
+        assert!(!unknown.changed);
+        assert!(registry.entries.is_empty());
+
+        registry.apply_hook("claude", event("UserPromptSubmit", None), None);
+        registry.apply_hook("claude", event("Notification", Some("idle_prompt")), None);
+        assert_eq!(registry.entries[0].status.state, "working");
+
+        // Every harness reaches the same state by sitting still.
+        registry.apply_hook("claude", event("Stop", None), None);
+        registry.entries[0].status.updated_at -= IDLE_AFTER_SECONDS;
+        assert!(registry.settle_quiet_entries());
+        assert_eq!(registry.entries[0].status.state, "idle");
+    }
+
+    #[test]
+    fn attention_reports_its_reason_and_background_work_survives_a_stop() {
+        let mut registry = Registry::default();
+        registry.apply_hook("claude", event("UserPromptSubmit", None), None);
+        assert!(registry.entries[0].status.started_at.is_some());
+
+        let mut stop = event("Stop", None);
+        stop.background = true;
+        registry.apply_hook("claude", stop, None);
+        assert!(registry.entries[0].status.background);
+        assert!(registry.entries[0].status.reason.is_none());
+
+        let permission = registry.apply_hook(
+            "claude",
+            event("Notification", Some("permission_prompt")),
+            None,
+        );
+        assert_eq!(
+            permission.notification.expect("attention notifies").reason,
+            Some("permission".to_owned())
+        );
+        assert_eq!(
+            registry.entries[0].status.reason.as_deref(),
+            Some("permission")
+        );
+
+        let subagent = registry.apply_hook(
+            "claude",
+            event("Notification", Some("agent_needs_input")),
+            None,
+        );
+        assert!(subagent.notification.is_none(), "same state, same news");
+        assert_eq!(
+            registry.entries[0].status.reason.as_deref(),
+            Some("subagent")
+        );
+
+        // A new turn clears both the reason and the finished turn's leftovers.
+        registry.apply_hook("claude", event("UserPromptSubmit", None), None);
+        assert!(registry.entries[0].status.reason.is_none());
+        assert!(!registry.entries[0].status.background);
+    }
+
+    #[test]
+    fn indicator_order_follows_the_threads_not_their_event_history() {
+        let mut registry = Registry::default();
+        for (session, cwd) in [("b", "/tmp/zebra"), ("a", "/tmp/apple")] {
+            let mut start = event("UserPromptSubmit", None);
+            start.session_id = session.to_owned();
+            start.cwd = cwd.to_owned();
+            registry.apply_hook("claude", start, None);
+        }
+        let ordered = registry.snapshot_json(Some("claude"));
+
+        // Re-registering the first thread must not move it to the end.
+        let mut restart = event("UserPromptSubmit", None);
+        restart.session_id = "b".to_owned();
+        restart.cwd = "/tmp/zebra".to_owned();
+        registry.entries.retain(|entry| entry.status.id != "b");
+        registry.apply_hook("claude", restart, None);
+
+        assert!(ordered.find("apple").unwrap() < ordered.find("zebra").unwrap());
+        assert_eq!(registry.snapshot_json(Some("claude")), ordered);
     }
 
     #[test]

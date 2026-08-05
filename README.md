@@ -112,13 +112,16 @@ subscriber rather than ending it, because a status bar cannot restart a
       "name": "example",
       "model": "gpt-5.6-sol",
       "turn_id": "019def...",
+      "reason": "permission",
+      "background": false,
+      "started_at": 1784161742,
       "updated_at": 1784161777
     }
   ]
 }
 ```
 
-The `state` field is `working`, `completed`, or `attention`:
+The `state` field is `working`, `completed`, `idle`, or `attention`:
 
 - Codex and Claude Code `UserPromptSubmit` become `working`, while `Stop`
   becomes `completed`. A session that has only started, without a submitted
@@ -126,9 +129,10 @@ The `state` field is `working`, `completed`, or `attention`:
 - Claude Code's `StopFailure` becomes `attention`. `Notification` also becomes
   `attention` for `permission_prompt`, `elicitation_dialog`, and
   `agent_needs_input`, and returns to `working` for `elicitation_complete` and
-  `elicitation_response`. The remaining types, including `idle_prompt`, report
-  that a settled session is waiting rather than that it needs interaction, and
-  are ignored. `SessionEnd` removes the entry.
+  `elicitation_response`. `SessionEnd` removes the entry.
+- A completed thread becomes `idle` once it has waited five minutes, or as soon
+  as Claude Code reports its own `idle_prompt`. Waiting is not attention: an
+  idle report never creates a thread and never interrupts one that is working.
 - pi `agent_start` becomes `working`, `agent_settled` becomes `completed` only
   after retries, automatic compaction, and queued continuations have finished,
   and the extension event `harness-status:attention` becomes `attention`.
@@ -138,15 +142,27 @@ The `state` field is `working`, `completed`, or `attention`:
   Pi then ignores its intentional idle settlement until the child result wakes
   the parent. `session_shutdown` removes the entry.
 
-A completed or attention entry remains visible until acknowledged, reused by
+A settled or attention entry remains visible until acknowledged, reused by
 another prompt, or its owning harness process exits. Claude Code and Pi also
 remove it when the session ends cleanly.
+
+The optional fields carry what a bar needs beyond the state itself. `reason`
+names why a thread wants the user — `permission`, `elicitation`, `subagent`, or
+`failure` — as a category, never the request itself. `background` marks a thread
+that stopped answering while its own work keeps running, which Claude Code
+reports through the background tasks and session crons named in its `Stop`
+event; only their presence is read, never their content. `started_at` is when
+the current turn began, so a bar can show how long it has run. Threads are
+ordered by harness, project name, and identifier rather than by the order their
+events arrived, so an indicator keeps its place while its neighbours come and
+go.
 
 The hook does not retain prompts, transcript contents, permission details, tool
 arguments, Claude's last response, or stop-failure details. Desktop notification
 arguments contain only the harness display name, project display name, and
-`finished` or `needs attention`; they never contain working directories, model
-or session identifiers, prompts, responses, tools, or permission details.
+`finished` or `needs attention` with the reason category; they never contain
+working directories, model or session identifiers, prompts, responses, tools, or
+permission details.
 
 Only the registry owner sends a desktop notification, and only when explicit
 interaction is required or a top-level harness fully settles. Delegated child
@@ -288,10 +304,13 @@ Place the exported widget wherever indicators should appear:
 ```
 
 The module defines no window or bar and assumes no window manager, monitor,
-paths, fonts, or consumer palette variables. Consumers can theme the semantic classes
-`.harness-status__indicator--working`,
+paths, fonts, or consumer palette variables. Consumers can theme the semantic
+classes `.harness-status__indicator--working`,
 `.harness-status__indicator--completed`,
+`.harness-status__indicator--idle`,
 `.harness-status__indicator--attention`,
+`.harness-status__indicator--reason-permission` and its siblings for the other
+reasons, `.harness-status__background`, and one class per harness:
 `.harness-status__indicator--codex`,
 `.harness-status__indicator--claude`, and
 `.harness-status__indicator--pi`. Working Codex turns use their ten-frame
@@ -300,8 +319,11 @@ Linux pulse sequence (`· ✢ * ✶ ✻ ✽` and back) at 300 ms per frame. All
 animation stays in Eww
 rather than the JSON stream. Completed Codex turns use a small dot, completed
 Claude turns use Claude Code's static `✻`, and completed pi turns use `π`.
-Attention uses a static `!` for every harness. Clicking any state acknowledges
-the indicator.
+Attention uses a static `!`, or `×` when a turn failed. An idle thread keeps its
+settled glyph at reduced opacity, and a thread whose own work is still running
+carries a trailing `⋯`. The tooltip names the project, the state or the reason
+it wants the user, the model, and how long the turn has run. Clicking any state
+acknowledges the indicator.
 
 All adapters share the same semantic working/completed/attention classes, so pi
 stays consistent with the other Eww indicators. Glyph choices live entirely in

@@ -10,6 +10,11 @@
   :initial "π"
   `while :; do for frame in π ϖ π ℼ; do printf '%s\\n' "$frame"; sleep 0.48; done; done`)
 
+(defpoll harness-status-clock
+  :interval "15s"
+  :initial "0"
+  "date +%s")
+
 (deflisten harness-status-codex-json
   :initial "{\"threads\":[]}"
   "harness-status codex --follow")
@@ -22,17 +27,35 @@
   :initial "{\"threads\":[]}"
   "harness-status pi --follow")
 
+;; One thread of one harness. A running thread shows the harness spinner, a
+;; settled one shows `glyph`, and one that wants the user shows why.
+(defwidget harness-status-thread [thread spinner glyph]
+  (box
+    :class "harness-status__thread"
+    :space-evenly false
+    (button
+      :class "harness-status__indicator harness-status__indicator--${thread.harness} harness-status__indicator--${thread.state} harness-status__indicator--reason-${thread?.reason ?: "none"}"
+      :tooltip "${thread.harness}: ${thread.name} · ${thread.state == "attention" ? (thread?.reason ?: "attention") : thread.state} · ${thread?.model ?: "unknown model"} · ${harness-status-clock > (thread?.started_at ?: thread.updated_at) ? round((harness-status-clock - (thread?.started_at ?: thread.updated_at)) / 60, 0) : 0}m"
+      :onclick "harness-status ack '${thread.id}'"
+      {thread.state == "working" ? spinner :
+       thread.state == "attention" ? (thread?.reason == "failure" ? "×" : "!") :
+       glyph})
+    (label
+      :class "harness-status__background"
+      :visible {thread?.background ?: false}
+      :tooltip "own work still running"
+      :text "⋯")))
+
 (defwidget harness-status-codex []
   (box
     :class "harness-status harness-status--codex"
     :space-evenly false
     (label :visible false :text "${harness-status-codex-spinner}")
     (for thread in {harness-status-codex-json.threads}
-      (button
-        :class "harness-status__indicator harness-status__indicator--codex harness-status__indicator--${thread.state}"
-        :tooltip "${thread.harness}: ${thread.name} — ${thread.state}"
-        :onclick "harness-status ack '${thread.id}'"
-        {thread.state == "working" ? harness-status-codex-spinner : thread.state == "attention" ? "!" : "•"}))))
+      (harness-status-thread
+        :thread thread
+        :spinner harness-status-codex-spinner
+        :glyph "•"))))
 
 (defwidget harness-status-claude []
   (box
@@ -40,11 +63,10 @@
     :space-evenly false
     (label :visible false :text "${harness-status-claude-spinner}")
     (for thread in {harness-status-claude-json.threads}
-      (button
-        :class "harness-status__indicator harness-status__indicator--claude harness-status__indicator--${thread.state}"
-        :tooltip "${thread.harness}: ${thread.name} — ${thread.state}"
-        :onclick "harness-status ack '${thread.id}'"
-        {thread.state == "working" ? harness-status-claude-spinner : thread.state == "attention" ? "!" : "✻"}))))
+      (harness-status-thread
+        :thread thread
+        :spinner harness-status-claude-spinner
+        :glyph "✻"))))
 
 (defwidget harness-status-pi []
   (box
@@ -52,8 +74,7 @@
     :space-evenly false
     (label :visible false :text "${harness-status-pi-spinner}")
     (for thread in {harness-status-pi-json.threads}
-      (button
-        :class "harness-status__indicator harness-status__indicator--pi harness-status__indicator--${thread.state}"
-        :tooltip "${thread.harness}: ${thread.name} — ${thread.state}"
-        :onclick "harness-status ack '${thread.id}'"
-        {thread.state == "working" ? harness-status-pi-spinner : thread.state == "attention" ? "!" : "π"}))))
+      (harness-status-thread
+        :thread thread
+        :spinner harness-status-pi-spinner
+        :glyph "π"))))

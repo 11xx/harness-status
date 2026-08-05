@@ -354,7 +354,7 @@ fn desktop_notifications_are_generic_and_transition_only() {
             "--app-name",
             "harness-status-claude",
             "Claude Code",
-            "example needs attention"
+            "example needs attention: permission"
         ]
     );
     assert!(

@@ -59,6 +59,8 @@ struct HarnessHookInput {
     #[serde(default)]
     turn_id: Option<String>,
     #[serde(default)]
+    prompt_id: Option<String>,
+    #[serde(default)]
     transcript_path: Option<PathBuf>,
     #[serde(default)]
     cwd: String,
@@ -97,6 +99,49 @@ struct TranscriptRecord {
     kind: String,
     #[serde(default)]
     payload: TranscriptPayload,
+    #[serde(rename = "promptId", default)]
+    prompt_id: Option<String>,
+    #[serde(rename = "interruptedMessageId", default)]
+    interrupted_message_id: Option<String>,
+    #[serde(default)]
+    message: TranscriptMessage,
+}
+
+#[derive(Default, Deserialize)]
+struct TranscriptMessage {
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Default)]
+struct TurnReport {
+    aborted: bool,
+    model: Option<String>,
+}
+
+impl TranscriptRecord {
+    /// Claude names the answering model on every assistant record, which keeps
+    /// the reported model correct across an in-session model switch.
+    fn answering_model(&self, harness: &str) -> Option<&str> {
+        (harness == "claude" && self.kind == "assistant")
+            .then_some(self.message.model.as_deref())
+            .flatten()
+    }
+
+    /// Each harness marks an abandoned turn in its own transcript vocabulary.
+    fn reports_abort(&self, harness: &str, turn_id: &str) -> bool {
+        match harness {
+            "codex" => {
+                self.kind == "event_msg"
+                    && self.payload.kind == "turn_aborted"
+                    && self.payload.turn_id.as_deref() == Some(turn_id)
+            }
+            "claude" => {
+                self.interrupted_message_id.is_some() && self.prompt_id.as_deref() == Some(turn_id)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -389,8 +434,12 @@ impl Registry {
         before != self.entries.len()
     }
 
-    fn reap_interrupted_turns(&mut self) -> bool {
+    /// Tails each running turn's transcript for the two facts a lifecycle hook
+    /// never delivers: that the user interrupted the turn, and which model
+    /// answered it.
+    fn follow_running_transcripts(&mut self) -> bool {
         let before = self.entries.len();
+        let mut changed = false;
         self.entries.retain_mut(|entry| {
             if entry.status.state != "working" {
                 return true;
@@ -401,9 +450,17 @@ impl Registry {
             let Some(transcript) = entry.transcript.as_mut() else {
                 return true;
             };
-            !transcript_reports_abort(transcript, turn_id).unwrap_or(false)
+            let report = read_transcript_turn(&entry.status.harness, transcript, turn_id)
+                .unwrap_or_default();
+            if let Some(model) = report.model.filter(|model| {
+                entry.status.model.as_deref() != Some(model.as_str()) && !model.is_empty()
+            }) {
+                entry.status.model = Some(model);
+                changed = true;
+            }
+            !report.aborted
         });
-        before != self.entries.len()
+        changed || before != self.entries.len()
     }
 
     fn snapshot_json(&self, harness: Option<&str>) -> String {
@@ -1063,7 +1120,17 @@ fn follow(harness: Option<&str>) -> io::Result<()> {
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                     ) =>
                 {
-                    fs::remove_file(&path)?;
+                    retire_dead_owner_socket(&path)?;
+                }
+                // A busy owner answers late; keep subscribing instead of exiting.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    follow_existing(&path, harness, &mut last_json)?;
+                    continue;
                 }
                 Err(error) => return Err(error),
             }
@@ -1095,7 +1162,7 @@ fn follow_as_owner(
     let state_path = registry_state_path(path);
     let notifier = Notifier::from_env();
     let mut registry = load_registry(&state_path);
-    registry.reap_interrupted_turns();
+    registry.follow_running_transcripts();
     registry.reap_dead_owners();
     checkpoint_registry(&state_path, &registry);
     let mut subscribers = Vec::new();
@@ -1148,7 +1215,7 @@ fn follow_as_owner(
             Err(error) => return Err(error),
         }
 
-        changed |= registry.reap_interrupted_turns();
+        changed |= registry.follow_running_transcripts();
         changed |= registry.reap_dead_owners();
         if changed {
             checkpoint_registry(&state_path, &registry);
@@ -1159,6 +1226,16 @@ fn follow_as_owner(
         if let Some(notification) = notification {
             notifier.send(notification);
         }
+    }
+}
+
+/// Concurrent followers race to retire the same dead owner's socket. Losing
+/// that race is how the winner is elected, so an already-removed path succeeds.
+fn retire_dead_owner_socket(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1391,7 +1468,7 @@ fn send_hook(harness: &str) {
     {
         return;
     }
-    let transcript = (harness == "codex")
+    let transcript = matches!(harness, "codex" | "claude")
         .then_some(input.transcript_path)
         .flatten()
         .map(|path| TranscriptCursor {
@@ -1407,7 +1484,7 @@ fn send_hook(harness: &str) {
     let event = HookEvent {
         event: input.hook_event_name,
         session_id: input.session_id,
-        turn_id: input.turn_id,
+        turn_id: input.turn_id.or(input.prompt_id),
         transcript,
         cwd: input.cwd,
         model: input.model,
@@ -1423,30 +1500,36 @@ fn send_hook(harness: &str) {
     send_fire_and_forget(&request);
 }
 
-fn transcript_reports_abort(cursor: &mut TranscriptCursor, turn_id: &str) -> io::Result<bool> {
+fn read_transcript_turn(
+    harness: &str,
+    cursor: &mut TranscriptCursor,
+    turn_id: &str,
+) -> io::Result<TurnReport> {
     let mut file = fs::File::open(&cursor.path)?;
     if file.metadata()?.len() < cursor.offset {
         cursor.offset = 0;
     }
     file.seek(SeekFrom::Start(cursor.offset))?;
     let mut reader = BufReader::new(file);
+    let mut report = TurnReport::default();
 
     loop {
         let mut line = String::new();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 || !line.ends_with('\n') {
-            return Ok(false);
+            return Ok(report);
         }
         cursor.offset += bytes as u64;
 
         let Ok(record) = serde_json::from_str::<TranscriptRecord>(&line) else {
             continue;
         };
-        if record.kind == "event_msg"
-            && record.payload.kind == "turn_aborted"
-            && record.payload.turn_id.as_deref() == Some(turn_id)
-        {
-            return Ok(true);
+        if let Some(model) = record.answering_model(harness) {
+            report.model = Some(model.to_owned());
+        }
+        if record.reports_abort(harness, turn_id) {
+            report.aborted = true;
+            return Ok(report);
         }
     }
 }
@@ -1763,6 +1846,16 @@ mod tests {
         assert!(ended.changed);
         assert!(ended.notification.is_none());
         assert!(registry.entries.is_empty());
+    }
+
+    #[test]
+    fn retiring_an_already_retired_owner_socket_succeeds() {
+        let path = env::temp_dir().join(format!("harness-status-absent-{}.sock", process::id()));
+        let _ = fs::remove_file(&path);
+        assert!(retire_dead_owner_socket(&path).is_ok());
+        UnixDatagram::bind(&path).expect("the path is free after retirement");
+        assert!(retire_dead_owner_socket(&path).is_ok());
+        assert!(!path.exists());
     }
 
     #[test]

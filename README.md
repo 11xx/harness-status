@@ -94,6 +94,10 @@ follower owns the registry, but any number of later `--follow` processes can
 subscribe to its current snapshot and future changes. Each subscriber keeps
 its own optional harness filter. If the owner exits, subscribers return to
 owner election; one restores the runtime checkpoint and the others resubscribe.
+Election is contended by design: losing the race to retire a dead owner's
+socket, or querying an owner that answers too slowly, makes a process a
+subscriber rather than ending it, because a status bar cannot restart a
+`deflisten` command that exits.
 
 ## JSON contract
 
@@ -161,17 +165,17 @@ notifier can lose that notification. When it can identify the owning harness
 process through `/proc`, the follower removes the entry after
 that process exits.
 
-To recognize an Esc interruption that does not emit `Stop`, the Codex adapter
-tails only new records from the hook-provided transcript path and reads the
-event type and turn ID. An unknown transcript format fails safely and leaves the
-click-to-ack fallback. Claude Code also omits `Stop` on user interruption, but
-its transcript does not expose Codex's turn-abort record. A Claude working entry
-therefore remains until its next lifecycle event, process exit, or manual
-acknowledgement. Claude's hook input does not include the active model or a turn
-ID, so those optional JSON fields are absent for Claude entries. Pi reports its
-active model but has no separate turn ID in this contract. Pi's
-`agent_settled` event also handles an Esc interruption without transcript
-inspection.
+Neither Codex nor Claude Code emits `Stop` for an Esc interruption, so while a
+turn runs both adapters tail only the records their own hook added to the
+transcript since the turn began. Codex recognizes its turn-abort event, and
+Claude Code an interrupted-message record carrying the same prompt identifier;
+either one retires the entry. An unknown transcript format fails safely and
+leaves the click-to-ack fallback. Claude's assistant records also name the
+answering model, which is how a Claude entry reports a model at all and how it
+stays correct across an in-session model switch. Claude's prompt identifier
+serves as its turn ID. Pi reports its active model but has no separate turn ID
+in this contract, and its `agent_settled` event handles an Esc interruption
+without transcript inspection.
 
 Codex generates local memories in background sessions rooted beneath
 `$CODEX_HOME/memories` (normally `~/.codex/memories`). Those internal sessions

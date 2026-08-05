@@ -209,11 +209,47 @@ fn claude_hook_to_jsonl_smoke() {
     assert_eq!(working["threads"][0]["harness"], "claude");
     assert_eq!(working["threads"][0]["name"], "example");
     assert!(working["threads"][0].get("model").is_none());
-    assert!(working["threads"][0].get("turn_id").is_none());
+    assert_eq!(working["threads"][0]["turn_id"], "prompt-smoke");
     let checkpoint = fs::read_to_string(state_path(&socket)).unwrap();
     assert!(!checkpoint.contains("sensitive transcript content"));
-    assert!(!checkpoint.contains("claude-transcript.jsonl"));
     assert!(!checkpoint.contains("not retained"));
+
+    let mut transcript_file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    writeln!(
+        transcript_file,
+        "{}",
+        json!({
+            "type": "assistant",
+            "promptId": "prompt-smoke",
+            "message": {"role": "assistant", "model": "claude-smoke-5"}
+        })
+    )
+    .unwrap();
+    wait_for_model(binary, &socket, "claude", "claude-smoke-5");
+
+    writeln!(
+        transcript_file,
+        "{}",
+        json!({
+            "type": "user",
+            "promptId": "prompt-smoke",
+            "interruptedMessageId": "msg-smoke",
+            "message": {"role": "user", "content": "[Request interrupted by user]"}
+        })
+    )
+    .unwrap();
+    wait_for_thread_count(binary, &socket, "claude", 0);
+    send_hook(
+        binary,
+        &socket,
+        "claude",
+        "UserPromptSubmit",
+        Some(&transcript),
+    );
+    wait_for_state(binary, &socket, "claude", "working");
 
     send_hook(binary, &socket, "claude", "Stop", Some(&transcript));
     wait_for_state(binary, &socket, "claude", "completed");
@@ -810,6 +846,9 @@ fn send_hook_with_owner(
         "prompt": "not retained",
         "last_assistant_message": "also not retained"
     });
+    if harness == "claude" {
+        input["prompt_id"] = json!("prompt-smoke");
+    }
     if harness == "codex" {
         input["turn_id"] = json!("turn-smoke");
         input["model"] = json!("gpt-smoke");
@@ -990,6 +1029,20 @@ fn wait_for_state(binary: &str, socket: &Path, harness: &str, state: &str) -> Va
         thread::sleep(Duration::from_millis(10));
     }
     panic!("status never reached {state}");
+}
+
+fn wait_for_model(binary: &str, socket: &Path, harness: &str, model: &str) -> Value {
+    for _ in 0..500 {
+        let snapshot = snapshot(binary, socket, harness);
+        if snapshot["threads"]
+            .as_array()
+            .is_some_and(|threads| threads.iter().any(|thread| thread["model"] == model))
+        {
+            return snapshot;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("status never reported model {model}");
 }
 
 fn wait_for_thread_count(binary: &str, socket: &Path, harness: &str, count: usize) -> Value {

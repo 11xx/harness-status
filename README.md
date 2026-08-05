@@ -117,11 +117,14 @@ owner election; one restores the runtime checkpoint and the others resubscribe.
 The `state` field is `working`, `completed`, or `attention`:
 
 - Codex and Claude Code `UserPromptSubmit` become `working`, while `Stop`
-  becomes `completed`. Claude Code `SessionStart` also becomes `working` so
-  non-interactive background runs are visible before their first prompt hook.
+  becomes `completed`. A session that has only started, without a submitted
+  prompt, has no entry; non-interactive runs submit a prompt like any other.
 - Claude Code's `StopFailure` becomes `attention`. `Notification` also becomes
-  `attention` for `permission_prompt`, `idle_prompt`, and `elicitation_dialog`;
-  `auth_success` is ignored.
+  `attention` for `permission_prompt`, `elicitation_dialog`, and
+  `agent_needs_input`, and returns to `working` for `elicitation_complete` and
+  `elicitation_response`. The remaining types, including `idle_prompt`, report
+  that a settled session is waiting rather than that it needs interaction, and
+  are ignored. `SessionEnd` removes the entry.
 - pi `agent_start` becomes `working`, `agent_settled` becomes `completed` only
   after retries, automatic compaction, and queued continuations have finished,
   and the extension event `harness-status:attention` becomes `attention`.
@@ -132,8 +135,8 @@ The `state` field is `working`, `completed`, or `attention`:
   the parent. `session_shutdown` removes the entry.
 
 A completed or attention entry remains visible until acknowledged, reused by
-another prompt, or its owning harness process exits. Pi also removes it during a clean
-session shutdown.
+another prompt, or its owning harness process exits. Claude Code and Pi also
+remove it when the session ends cleanly.
 
 The hook does not retain prompts, transcript contents, permission details, tool
 arguments, Claude's last response, or stop-failure details. Desktop notification
@@ -214,8 +217,9 @@ harness-status install claude
 
 The command honors `$CLAUDE_CONFIG_DIR`, defaults to
 `~/.claude/settings.json`, preserves unrelated settings and hook definitions,
-and records the absolute path to the current executable. It is idempotent, and
-removes only its own callbacks with:
+and records the absolute path to the current executable. It is idempotent,
+drops its own callbacks for events it no longer uses, and removes only its own
+callbacks with:
 
 ```sh
 harness-status uninstall claude

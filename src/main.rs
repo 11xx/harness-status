@@ -17,13 +17,15 @@ const REAP_INTERVAL: Duration = Duration::from_millis(500);
 const SUBSCRIBER_HEARTBEAT: Duration = Duration::from_secs(2);
 const STATE_VERSION: u32 = 1;
 const CODEX_HOOK_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
+const CODEX_RETIRED_HOOK_EVENTS: [&str; 0] = [];
 const CLAUDE_HOOK_EVENTS: [&str; 5] = [
-    "SessionStart",
     "UserPromptSubmit",
     "Stop",
     "StopFailure",
     "Notification",
+    "SessionEnd",
 ];
+const CLAUDE_RETIRED_HOOK_EVENTS: [&str; 1] = ["SessionStart"];
 const NOTIFIER_TIMEOUT: Duration = Duration::from_secs(1);
 const LEGACY_CODEX_HOOK_COMMAND: &str = "harness-status hook codex";
 const LEGACY_CLAUDE_HOOK_COMMAND: &str = "harness-status hook claude";
@@ -257,7 +259,10 @@ impl Registry {
             notification_type,
             delegated,
         } = event;
-        if harness == "pi" && event == "SessionShutdown" {
+        if matches!(
+            (harness, event.as_str()),
+            ("pi", "SessionShutdown") | ("claude", "SessionEnd")
+        ) {
             let before = self.entries.len();
             self.entries
                 .retain(|entry| entry.status.harness != harness || entry.status.id != session_id);
@@ -268,9 +273,9 @@ impl Registry {
         }
 
         let state = match (harness, event.as_str()) {
-            ("claude", "SessionStart")
-            | ("codex" | "claude", "UserPromptSubmit")
-            | ("pi", "AgentStart" | "ResumeWorking") => "working",
+            ("codex" | "claude", "UserPromptSubmit") | ("pi", "AgentStart" | "ResumeWorking") => {
+                "working"
+            }
             ("codex" | "claude", "Stop") | ("pi", "AgentSettled" | "ResumeCompleted") => {
                 "completed"
             }
@@ -278,10 +283,18 @@ impl Registry {
             ("claude", "Notification")
                 if matches!(
                     notification_type.as_deref(),
-                    Some("permission_prompt" | "idle_prompt" | "elicitation_dialog")
+                    Some("permission_prompt" | "elicitation_dialog" | "agent_needs_input")
                 ) =>
             {
                 "attention"
+            }
+            ("claude", "Notification")
+                if matches!(
+                    notification_type.as_deref(),
+                    Some("elicitation_complete" | "elicitation_response")
+                ) =>
+            {
+                "working"
             }
             _ => {
                 return HookResult {
@@ -543,6 +556,7 @@ fn install_integration(harness: &str) -> io::Result<()> {
             "codex",
             codex_hooks_path()?,
             &CODEX_HOOK_EVENTS,
+            &CODEX_RETIRED_HOOK_EVENTS,
             LEGACY_CODEX_HOOK_COMMAND,
         ),
         "claude" => install_hooks(
@@ -550,6 +564,7 @@ fn install_integration(harness: &str) -> io::Result<()> {
             "claude",
             claude_settings_path()?,
             &CLAUDE_HOOK_EVENTS,
+            &CLAUDE_RETIRED_HOOK_EVENTS,
             LEGACY_CLAUDE_HOOK_COMMAND,
         ),
         "pi" => install_pi_extension(),
@@ -564,6 +579,7 @@ fn uninstall_integration(harness: &str) -> io::Result<()> {
             "codex",
             codex_hooks_path()?,
             &CODEX_HOOK_EVENTS,
+            &CODEX_RETIRED_HOOK_EVENTS,
             LEGACY_CODEX_HOOK_COMMAND,
         ),
         "claude" => uninstall_hooks(
@@ -571,6 +587,7 @@ fn uninstall_integration(harness: &str) -> io::Result<()> {
             "claude",
             claude_settings_path()?,
             &CLAUDE_HOOK_EVENTS,
+            &CLAUDE_RETIRED_HOOK_EVENTS,
             LEGACY_CLAUDE_HOOK_COMMAND,
         ),
         "pi" => uninstall_pi_extension(),
@@ -590,6 +607,7 @@ fn install_hooks(
     harness: &str,
     display_path: PathBuf,
     events: &[&str],
+    retired_events: &[&str],
     legacy_command: &str,
 ) -> io::Result<()> {
     let path = writable_config_path(&display_path)?;
@@ -607,6 +625,13 @@ fn install_hooks(
     for &event in events {
         changed |= install_event_handler(hooks, event, &target_handler, &command, legacy_command)?;
     }
+    changed |= remove_managed_events(
+        hooks,
+        retired_events,
+        &command,
+        legacy_command,
+        &display_path,
+    )?;
 
     if changed {
         write_json_atomic(&path, &document)?;
@@ -633,6 +658,7 @@ fn uninstall_hooks(
     harness: &str,
     display_path: PathBuf,
     events: &[&str],
+    retired_events: &[&str],
     legacy_command: &str,
 ) -> io::Result<()> {
     let path = writable_config_path(&display_path)?;
@@ -654,20 +680,8 @@ fn uninstall_hooks(
         let hooks = hooks_value.as_object_mut().ok_or_else(|| {
             invalid_hook_config(&display_path, "top-level 'hooks' must be an object")
         })?;
-        let mut empty_events = Vec::new();
-        for &event in events {
-            if let Some(groups_value) = hooks.get_mut(event) {
-                let groups = groups_value.as_array_mut().ok_or_else(|| {
-                    invalid_hook_config(&display_path, &format!("hooks.{event} must be an array"))
-                })?;
-                changed |= remove_owned_handlers(groups, event, &command, legacy_command)? > 0;
-                if groups.is_empty() {
-                    empty_events.push(event);
-                }
-            }
-        }
-        for event in empty_events {
-            hooks.remove(event);
+        for list in [events, retired_events] {
+            changed |= remove_managed_events(hooks, list, &command, legacy_command, &display_path)?;
         }
         hooks_are_empty = hooks.is_empty();
     }
@@ -903,6 +917,33 @@ fn install_event_handler(
     remove_owned_handlers(groups, event, command, legacy_command)?;
     groups.push(json!({ "hooks": [target_handler.clone()] }));
     Ok(true)
+}
+
+fn remove_managed_events(
+    hooks: &mut Map<String, Value>,
+    events: &[&str],
+    command: &str,
+    legacy_command: &str,
+    display_path: &Path,
+) -> io::Result<bool> {
+    let mut changed = false;
+    let mut empty_events = Vec::new();
+    for &event in events {
+        let Some(groups_value) = hooks.get_mut(event) else {
+            continue;
+        };
+        let groups = groups_value.as_array_mut().ok_or_else(|| {
+            invalid_hook_config(display_path, &format!("hooks.{event} must be an array"))
+        })?;
+        changed |= remove_owned_handlers(groups, event, command, legacy_command)? > 0;
+        if groups.is_empty() {
+            empty_events.push(event);
+        }
+    }
+    for event in empty_events {
+        hooks.remove(event);
+    }
+    Ok(changed)
 }
 
 fn remove_owned_handlers(
@@ -1694,16 +1735,34 @@ mod tests {
         assert!(attention.changed);
         assert_eq!(attention.notification.unwrap().state, "attention");
 
-        let duplicate_attention =
-            registry.apply_hook("claude", event("Notification", Some("idle_prompt")), None);
+        let duplicate_attention = registry.apply_hook(
+            "claude",
+            event("Notification", Some("permission_prompt")),
+            None,
+        );
         assert!(duplicate_attention.changed);
         assert!(duplicate_attention.notification.is_none());
 
-        let ignored =
-            registry.apply_hook("claude", event("Notification", Some("auth_success")), None);
-        assert!(!ignored.changed);
-        assert!(ignored.notification.is_none());
-        assert_eq!(registry.entries[0].status.state, "attention");
+        for ignored_type in ["auth_success", "idle_prompt", "agent_completed"] {
+            let ignored =
+                registry.apply_hook("claude", event("Notification", Some(ignored_type)), None);
+            assert!(!ignored.changed);
+            assert!(ignored.notification.is_none());
+            assert_eq!(registry.entries[0].status.state, "attention");
+        }
+
+        let resumed = registry.apply_hook(
+            "claude",
+            event("Notification", Some("elicitation_response")),
+            None,
+        );
+        assert!(resumed.notification.is_none());
+        assert_eq!(registry.entries[0].status.state, "working");
+
+        let ended = registry.apply_hook("claude", event("SessionEnd", None), None);
+        assert!(ended.changed);
+        assert!(ended.notification.is_none());
+        assert!(registry.entries.is_empty());
     }
 
     #[test]

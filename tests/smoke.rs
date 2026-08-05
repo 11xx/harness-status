@@ -197,7 +197,13 @@ fn claude_hook_to_jsonl_smoke() {
 
     let transcript = dir.join("claude-transcript.jsonl");
     fs::write(&transcript, "sensitive transcript content\n").unwrap();
-    send_hook(binary, &socket, "claude", "SessionStart", Some(&transcript));
+    send_hook(
+        binary,
+        &socket,
+        "claude",
+        "UserPromptSubmit",
+        Some(&transcript),
+    );
     let working = wait_for_state(binary, &socket, "claude", "working");
     assert_eq!(working["threads"][0]["id"], "claude-thread-smoke");
     assert_eq!(working["threads"][0]["harness"], "claude");
@@ -229,6 +235,25 @@ fn claude_hook_to_jsonl_smoke() {
         Some("permission_prompt"),
     );
     wait_for_state(binary, &socket, "claude", "attention");
+    send_hook_with_notification_type(
+        binary,
+        &socket,
+        "claude",
+        "Notification",
+        Some("elicitation_complete"),
+    );
+    wait_for_state(binary, &socket, "claude", "working");
+    send_hook(binary, &socket, "claude", "SessionEnd", Some(&transcript));
+    wait_for_thread_count(binary, &socket, "claude", 0);
+
+    send_hook(
+        binary,
+        &socket,
+        "claude",
+        "UserPromptSubmit",
+        Some(&transcript),
+    );
+    wait_for_state(binary, &socket, "claude", "working");
     assert!(
         Command::new(binary)
             .args(["ack", "claude-thread-smoke"])
@@ -553,6 +578,11 @@ fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {
           {
             "type": "command",
             "command": "also-keep-me"
+          },
+          {
+            "type": "command",
+            "command": "harness-status hook claude",
+            "timeout": 5
           }
         ]
       }
@@ -584,15 +614,22 @@ fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {
     let installed: Value = serde_json::from_slice(&installed_bytes).unwrap();
     assert_eq!(installed["model"], "keep-me");
     assert_eq!(
+        installed["hooks"]["SessionStart"][0]["hooks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
         installed["hooks"]["SessionStart"][0]["hooks"][0]["command"],
         "also-keep-me"
     );
     for event in [
-        "SessionStart",
         "UserPromptSubmit",
         "Stop",
         "StopFailure",
         "Notification",
+        "SessionEnd",
     ] {
         let commands: Vec<&str> = installed["hooks"][event]
             .as_array()
@@ -631,6 +668,7 @@ fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {
     assert!(uninstalled["hooks"].get("Stop").is_none());
     assert!(uninstalled["hooks"].get("StopFailure").is_none());
     assert!(uninstalled["hooks"].get("Notification").is_none());
+    assert!(uninstalled["hooks"].get("SessionEnd").is_none());
 
     let reuninstall = Command::new(binary)
         .args(["uninstall", "claude"])

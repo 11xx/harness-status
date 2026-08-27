@@ -49,7 +49,7 @@ Rust 1.97 or newer is recommended.
 
 ```sh
 cargo build --release
-cargo install --path . --root "$HOME/.local"
+cargo install --path . --root "$HOME/.local" --force
 harness-status install codex
 harness-status install claude
 harness-status install pi
@@ -218,8 +218,11 @@ harness-status install codex
 ```
 
 The command honors `$CODEX_HOME`, defaults to `~/.codex/hooks.json`, preserves
-unrelated definitions, and records the absolute path to the current executable.
-It is safe to repeat. To remove only the `harness-status` callbacks, run:
+unrelated definitions, and records the absolute path to the `harness-status`
+executable resolved from `PATH`. Install the deployed binary before running the
+installer so hook callbacks continue to use that installed copy even when the
+installer was invoked through a build path. It is safe to repeat. To remove
+only the `harness-status` callbacks, run:
 
 ```sh
 harness-status uninstall codex
@@ -247,9 +250,11 @@ harness-status install claude
 
 The command honors `$CLAUDE_CONFIG_DIR`, defaults to
 `~/.claude/settings.json`, preserves unrelated settings and hook definitions,
-and records the absolute path to the current executable. It is idempotent,
-drops its own callbacks for events it no longer uses, and removes only its own
-callbacks with:
+and records the absolute path to the `harness-status` executable resolved from
+`PATH`. Install the deployed binary before running the installer so hook
+callbacks continue to use that installed copy even when the installer was
+invoked through a build path. It is idempotent, drops its own callbacks for
+events it no longer uses, and removes only its own callbacks with:
 
 ```sh
 harness-status uninstall claude
@@ -272,8 +277,11 @@ harness-status install pi
 
 The command honors `$PI_CODING_AGENT_DIR`, defaults to
 `~/.pi/agent/extensions/harness-status.ts`, and embeds the absolute path to the
-current executable. It refuses to overwrite or remove an unmanaged file at
-that path. Installation and removal are idempotent:
+`harness-status` executable resolved from `PATH`. Install the deployed binary
+before running the installer so the extension continues to use that installed
+copy even when the installer was invoked through a build path. It refuses to
+overwrite or remove an unmanaged file at that path. Installation and removal
+are idempotent:
 
 ```sh
 harness-status uninstall pi

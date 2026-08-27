@@ -2,7 +2,8 @@
  * Pi lifecycle adapter for harness-status.
  *
  * Copy this file to ~/.pi/agent/extensions/ for a PATH-based manual install,
- * or run `harness-status install pi` to install it with an absolute binary path.
+ * or run `harness-status install pi` to install it with the absolute PATH-resolved
+ * binary path.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";

@@ -115,7 +115,8 @@ subscriber rather than ending it, because a status bar cannot restart a
       "reason": "permission",
       "background": false,
       "started_at": 1784161742,
-      "updated_at": 1784161777
+      "updated_at": 1784161777,
+      "duration": "35s"
     }
   ]
 }
@@ -152,10 +153,19 @@ names why a thread wants the user — `permission`, `elicitation`, `subagent`, o
 that stopped answering while its own work keeps running, which Claude Code
 reports through the background tasks and session crons named in its `Stop`
 event; only their presence is read, never their content. `started_at` is when
-the current turn began, so a bar can show how long it has run. Threads are
-ordered by harness, project name, and identifier rather than by the order their
-events arrived, so an indicator keeps its place while its neighbours come and
-go.
+the current turn began, and only a new prompt starts it over — a resume returns
+to a turn already under way and leaves its clock alone. Threads are ordered by
+harness, project name, and identifier rather than by the order their events
+arrived, so an indicator keeps its place while its neighbours come and go.
+
+`duration` is that turn's length, already formatted, so a bar renders it without
+arithmetic or a clock of its own: whole seconds below a minute, then whole
+minutes, then `2h05m`, always the unit reached rather than the nearest one. A
+running turn is measured against now and a settled one against the moment it
+settled, so a settled thread reports how long its turn ran instead of a number
+that climbs while nothing happens. Because a running turn advances with no event
+to announce it, follow mode republishes as the duration changes; a registry
+whose threads all sit still emits nothing.
 
 The hook does not retain prompts, transcript contents, permission details, tool
 arguments, Claude's last response, or stop-failure details. Desktop notification
@@ -322,8 +332,9 @@ Claude turns use Claude Code's static `✻`, and completed pi turns use `π`.
 Attention uses a static `!`, or `×` when a turn failed. An idle thread keeps its
 settled glyph at reduced opacity, and a thread whose own work is still running
 carries a trailing `⋯`. The tooltip names the project, the state or the reason
-it wants the user, the model, and how long the turn has run. Clicking any state
-acknowledges the indicator.
+it wants the user, the model, and the turn's `duration` as the stream already
+formatted it, so the module needs no timer or clock variable of its own.
+Clicking any state acknowledges the indicator.
 
 All adapters share the same semantic working/completed/attention classes, so pi
 stays consistent with the other Eww indicators. Glyph choices live entirely in

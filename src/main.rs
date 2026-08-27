@@ -205,6 +205,41 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+impl ThreadStatus {
+    /// A running turn is measured against now, a settled one against the moment
+    /// it settled, so a settled thread reports how long its turn ran instead of
+    /// a number that keeps climbing while nothing happens.
+    fn elapsed_seconds(&self, now: u64) -> u64 {
+        let end = if self.state == "working" {
+            now
+        } else {
+            self.updated_at
+        };
+        end.saturating_sub(self.started_at.unwrap_or(self.updated_at))
+    }
+}
+
+/// Whole units only: a turn is reported by the time it has actually completed,
+/// never rounded up into a minute it has not reached.
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h{:02}m", seconds / 3600, seconds % 3600 / 60)
+    }
+}
+
+/// The status a subscriber sees: the thread's own fields, plus the turn
+/// duration already formatted so a bar never has to compute a clock of its own.
+#[derive(Serialize)]
+struct ThreadView<'a> {
+    #[serde(flatten)]
+    status: &'a ThreadStatus,
+    duration: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct Entry {
     status: ThreadStatus,
@@ -221,7 +256,7 @@ struct Subscriber {
 
 #[derive(Serialize)]
 struct Snapshot<'a> {
-    threads: Vec<&'a ThreadStatus>,
+    threads: Vec<ThreadView<'a>>,
 }
 
 struct HookResult {
@@ -550,6 +585,14 @@ impl Registry {
         threads.sort_unstable_by(|left, right| {
             (&left.harness, &left.name, &left.id).cmp(&(&right.harness, &right.name, &right.id))
         });
+        let now = unix_time_seconds();
+        let threads = threads
+            .into_iter()
+            .map(|status| ThreadView {
+                duration: format_duration(status.elapsed_seconds(now)),
+                status,
+            })
+            .collect();
         serde_json::to_string(&Snapshot { threads }).expect("serializing status cannot fail")
     }
 }
@@ -1300,10 +1343,13 @@ fn follow_as_owner(
         changed |= registry.reap_dead_owners();
         if changed {
             checkpoint_registry(&state_path, &registry);
-            let json = registry.snapshot_json(harness);
-            print_json_if_changed(last_json, json);
-            publish_subscribers(&socket, &registry, &mut subscribers);
         }
+        // A running turn's duration advances without any event to announce it,
+        // so every wake-up republishes. Both paths compare against what they
+        // last sent, which keeps a still registry silent.
+        let json = registry.snapshot_json(harness);
+        print_json_if_changed(last_json, json);
+        publish_subscribers(&socket, &registry, &mut subscribers);
         if let Some(notification) = notification {
             notifier.send(notification);
         }
@@ -2039,6 +2085,59 @@ mod tests {
         registry.apply_hook("pi", event("Attention", None), None);
         registry.apply_hook("pi", event("ResumeWorking", None), None);
         assert_eq!(registry.entries[0].status.started_at, Some(BEGAN));
+    }
+
+    #[test]
+    fn a_turn_is_reported_by_whole_units_it_has_reached() {
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(59), "59s");
+        assert_eq!(format_duration(60), "1m");
+        // Ninety seconds is one minute, never the two a nearest-unit round
+        // would report.
+        assert_eq!(format_duration(90), "1m");
+        assert_eq!(format_duration(3599), "59m");
+        assert_eq!(format_duration(3600), "1h00m");
+        assert_eq!(format_duration(7500), "2h05m");
+    }
+
+    #[test]
+    fn a_settled_turn_reports_its_own_length_not_how_long_ago_it_began() {
+        let mut registry = Registry::default();
+        registry.apply_hook("claude", event("UserPromptSubmit", None), None);
+        let status = &mut registry.entries[0].status;
+        status.started_at = Some(1_000);
+        status.updated_at = 1_000;
+
+        // A running turn is measured against now, and keeps climbing.
+        assert_eq!(status.elapsed_seconds(1_090), 90);
+        assert_eq!(status.elapsed_seconds(1_300), 300);
+
+        // A clock that still lags the turn's start never reads as negative.
+        assert_eq!(status.elapsed_seconds(900), 0);
+
+        // Once settled, the turn's length is fixed no matter how long it waits.
+        registry.apply_hook("claude", event("Stop", None), None);
+        let status = &mut registry.entries[0].status;
+        status.started_at = Some(1_000);
+        status.updated_at = 1_180;
+        assert_eq!(status.elapsed_seconds(1_180), 180);
+        assert_eq!(status.elapsed_seconds(9_999), 180);
+    }
+
+    #[test]
+    fn every_thread_carries_a_duration_a_bar_can_render_directly() {
+        let mut registry = Registry::default();
+        registry.apply_hook("claude", event("UserPromptSubmit", None), None);
+        registry.entries[0].status.started_at = Some(0);
+        registry.entries[0].status.updated_at = 0;
+
+        let snapshot: Value =
+            serde_json::from_str(&registry.snapshot_json(Some("claude"))).unwrap();
+        let thread = &snapshot["threads"][0];
+        assert!(thread["duration"].as_str().is_some());
+        // The thread's own fields survive alongside it.
+        assert_eq!(thread["state"], "working");
+        assert_eq!(thread["name"], "project");
     }
 
     #[test]

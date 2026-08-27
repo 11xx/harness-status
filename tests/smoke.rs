@@ -146,7 +146,10 @@ fn codex_hook_to_jsonl_smoke() {
     final_owner.kill().unwrap();
     final_owner.wait().unwrap();
 
-    let states: Vec<Option<String>> = String::from_utf8(output.stdout)
+    // A running turn republishes as its duration advances, so the same state
+    // legitimately repeats; what the stream must never do is lose a transition
+    // or deliver one out of order.
+    let mut states: Vec<Option<String>> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -158,6 +161,7 @@ fn codex_hook_to_jsonl_smoke() {
                 .map(str::to_owned)
         })
         .collect();
+    states.dedup();
     assert_eq!(
         states,
         [

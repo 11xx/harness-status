@@ -601,6 +601,52 @@ fn verify_codex_hook_lifecycle(binary: &str, dir: &Path) {
         .unwrap();
     assert!(reuninstall.status.success());
     assert_eq!(fs::read(&hooks_path).unwrap(), uninstalled_bytes);
+
+    verify_uninstall_leaves_no_empty_hooks(binary, dir);
+    verify_uninstall_keeps_a_config_holding_nothing_of_ours(binary, dir);
+}
+
+/// A config that held only our handlers keeps no hollow `hooks` object once
+/// they are gone.
+fn verify_uninstall_leaves_no_empty_hooks(binary: &str, dir: &Path) {
+    let codex_home = dir.join("codex-home-only-ours");
+    fs::create_dir(&codex_home).unwrap();
+    let hooks_path = codex_home.join("hooks.json");
+
+    let install = Command::new(binary)
+        .args(["install", "codex"])
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+
+    let uninstall = Command::new(binary)
+        .args(["uninstall", "codex"])
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .unwrap();
+    assert!(uninstall.status.success());
+    let document: Value = serde_json::from_slice(&fs::read(&hooks_path).unwrap()).unwrap();
+    assert!(document.get("hooks").is_none());
+    assert_eq!(document.as_object().unwrap().len(), 0);
+}
+
+/// Uninstall reports nothing to do without rewriting a file it owns no part
+/// of, including the empty `hooks` object it did not put there.
+fn verify_uninstall_keeps_a_config_holding_nothing_of_ours(binary: &str, dir: &Path) {
+    let codex_home = dir.join("codex-home-foreign");
+    fs::create_dir(&codex_home).unwrap();
+    let hooks_path = codex_home.join("hooks.json");
+    let original = "{\n  \"model\": \"keep-me\",\n  \"hooks\": {}\n}\n";
+    fs::write(&hooks_path, original).unwrap();
+
+    let uninstall = Command::new(binary)
+        .args(["uninstall", "codex"])
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .unwrap();
+    assert!(uninstall.status.success());
+    assert_eq!(fs::read_to_string(&hooks_path).unwrap(), original);
 }
 
 fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {

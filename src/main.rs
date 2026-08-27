@@ -863,7 +863,10 @@ fn uninstall_hooks(
         for list in [events, retired_events] {
             changed |= remove_managed_events(hooks, list, &command, legacy_command, &display_path)?;
         }
-        hooks_are_empty = hooks.is_empty();
+        // Ours to drop only when our own removals emptied it. An object that
+        // never held anything of ours is not ours to rewrite, and only a write
+        // could carry the removal anywhere.
+        hooks_are_empty = changed && hooks.is_empty();
     }
 
     if hooks_are_empty {

@@ -514,40 +514,37 @@ fn verify_codex_hook_lifecycle(binary: &str, dir: &Path) {
     let codex_home = dir.join("codex-home");
     fs::create_dir(&codex_home).unwrap();
     let hooks_path = codex_home.join("hooks.json");
-    fs::write(
-        &hooks_path,
-        r#"{
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "keep-me"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "harness-status hook codex",
-            "timeout": 5
-          }
-        ]
-      }
-    ]
-  }
-}
-"#,
-    )
-    .unwrap();
+    let (path_executable, path_env) = test_path(dir);
+    let stale_command = stale_build_command(dir, "codex");
+    let initial = json!({
+        "hooks": {
+            "SessionStart": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "keep-me"
+                }]
+            }],
+            "UserPromptSubmit": [
+                {"hooks": [{
+                    "type": "command",
+                    "command": "harness-status hook codex",
+                    "timeout": 5
+                }]},
+                {"hooks": [{
+                    "type": "command",
+                    "command": stale_command,
+                    "timeout": 5
+                }]}
+            ]
+        }
+    });
+    fs::write(&hooks_path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+    let expected_command = format!("'{}' hook codex", path_executable.display());
 
     let install = Command::new(binary)
         .args(["install", "codex"])
         .env("CODEX_HOME", &codex_home)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(install.status.success());
@@ -567,13 +564,13 @@ fn verify_codex_hook_lifecycle(binary: &str, dir: &Path) {
             .map(|handler| handler["command"].as_str().unwrap())
             .collect();
         assert_eq!(commands.len(), 1);
-        assert!(commands[0].ends_with("' hook codex"));
-        assert!(commands[0].contains(binary));
+        assert_eq!(commands, vec![expected_command.as_str()]);
     }
 
     let reinstall = Command::new(binary)
         .args(["install", "codex"])
         .env("CODEX_HOME", &codex_home)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(reinstall.status.success());
@@ -582,6 +579,7 @@ fn verify_codex_hook_lifecycle(binary: &str, dir: &Path) {
     let uninstall = Command::new(binary)
         .args(["uninstall", "codex"])
         .env("CODEX_HOME", &codex_home)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(uninstall.status.success());
@@ -597,6 +595,7 @@ fn verify_codex_hook_lifecycle(binary: &str, dir: &Path) {
     let reuninstall = Command::new(binary)
         .args(["uninstall", "codex"])
         .env("CODEX_HOME", &codex_home)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(reuninstall.status.success());
@@ -612,10 +611,12 @@ fn verify_uninstall_leaves_no_empty_hooks(binary: &str, dir: &Path) {
     let codex_home = dir.join("codex-home-only-ours");
     fs::create_dir(&codex_home).unwrap();
     let hooks_path = codex_home.join("hooks.json");
+    let (_, path_env) = test_path(dir);
 
     let install = Command::new(binary)
         .args(["install", "codex"])
         .env("CODEX_HOME", &codex_home)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(install.status.success());
@@ -623,6 +624,7 @@ fn verify_uninstall_leaves_no_empty_hooks(binary: &str, dir: &Path) {
     let uninstall = Command::new(binary)
         .args(["uninstall", "codex"])
         .env("CODEX_HOME", &codex_home)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(uninstall.status.success());
@@ -637,12 +639,14 @@ fn verify_uninstall_keeps_a_config_holding_nothing_of_ours(binary: &str, dir: &P
     let codex_home = dir.join("codex-home-foreign");
     fs::create_dir(&codex_home).unwrap();
     let hooks_path = codex_home.join("hooks.json");
+    let (_, path_env) = test_path(dir);
     let original = "{\n  \"model\": \"keep-me\",\n  \"hooks\": {}\n}\n";
     fs::write(&hooks_path, original).unwrap();
 
     let uninstall = Command::new(binary)
         .args(["uninstall", "codex"])
         .env("CODEX_HOME", &codex_home)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(uninstall.status.success());
@@ -653,46 +657,31 @@ fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {
     let claude_config = dir.join("claude-config");
     fs::create_dir(&claude_config).unwrap();
     let settings_path = claude_config.join("settings.json");
-    fs::write(
-        &settings_path,
-        r#"{
-  "model": "keep-me",
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "also-keep-me"
-          },
-          {
-            "type": "command",
-            "command": "harness-status hook claude",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "harness-status hook claude",
-            "timeout": 5
-          }
-        ]
-      }
-    ]
-  }
-}
-"#,
-    )
-    .unwrap();
+    let (path_executable, path_env) = test_path(dir);
+    let initial = json!({
+        "model": "keep-me",
+        "hooks": {
+            "SessionStart": [{
+                "hooks": [
+                    {"type": "command", "command": "also-keep-me"},
+                    {"type": "command", "command": "harness-status hook claude", "timeout": 5},
+                    {"type": "command", "command": stale_build_command(dir, "claude"), "timeout": 5}
+                ]
+            }],
+            "Stop": [{
+                "hooks": [
+                    {"type": "command", "command": "harness-status hook claude", "timeout": 5}
+                ]
+            }]
+        }
+    });
+    fs::write(&settings_path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+    let expected_command = format!("'{}' hook claude", path_executable.display());
 
     let install = Command::new(binary)
         .args(["install", "claude"])
         .env("CLAUDE_CONFIG_DIR", &claude_config)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(install.status.success());
@@ -723,15 +712,14 @@ fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {
             .iter()
             .flat_map(|group| group["hooks"].as_array().unwrap())
             .filter_map(|handler| handler["command"].as_str())
-            .filter(|command| command.ends_with("' hook claude"))
             .collect();
-        assert_eq!(commands.len(), 1);
-        assert!(commands[0].contains(binary));
+        assert_eq!(commands, vec![expected_command.as_str()]);
     }
 
     let reinstall = Command::new(binary)
         .args(["install", "claude"])
         .env("CLAUDE_CONFIG_DIR", &claude_config)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(reinstall.status.success());
@@ -740,6 +728,7 @@ fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {
     let uninstall = Command::new(binary)
         .args(["uninstall", "claude"])
         .env("CLAUDE_CONFIG_DIR", &claude_config)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(uninstall.status.success());
@@ -759,6 +748,7 @@ fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {
     let reuninstall = Command::new(binary)
         .args(["uninstall", "claude"])
         .env("CLAUDE_CONFIG_DIR", &claude_config)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(reuninstall.status.success());
@@ -768,17 +758,22 @@ fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {
 fn verify_pi_extension_lifecycle(binary: &str, dir: &Path) {
     let pi_agent_dir = dir.join("pi-agent");
     let extension_path = pi_agent_dir.join("extensions/harness-status.ts");
+    let (path_executable, path_env) = test_path(dir);
 
     let install = Command::new(binary)
         .args(["install", "pi"])
         .env("PI_CODING_AGENT_DIR", &pi_agent_dir)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(install.status.success());
     let installed_bytes = fs::read(&extension_path).unwrap();
     let installed = String::from_utf8(installed_bytes.clone()).unwrap();
     assert!(installed.starts_with("// Managed by harness-status."));
-    assert!(installed.contains(binary));
+    assert!(installed.contains(&format!(
+        "const HARNESS_STATUS = \"{}\";",
+        path_executable.display()
+    )));
     assert!(installed.contains("agent_start"));
     assert!(installed.contains("agent_settled"));
     assert!(installed.contains("session_shutdown"));
@@ -798,6 +793,7 @@ fn verify_pi_extension_lifecycle(binary: &str, dir: &Path) {
     let reinstall = Command::new(binary)
         .args(["install", "pi"])
         .env("PI_CODING_AGENT_DIR", &pi_agent_dir)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(reinstall.status.success());
@@ -806,6 +802,7 @@ fn verify_pi_extension_lifecycle(binary: &str, dir: &Path) {
     let uninstall = Command::new(binary)
         .args(["uninstall", "pi"])
         .env("PI_CODING_AGENT_DIR", &pi_agent_dir)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(uninstall.status.success());
@@ -814,6 +811,7 @@ fn verify_pi_extension_lifecycle(binary: &str, dir: &Path) {
     let reuninstall = Command::new(binary)
         .args(["uninstall", "pi"])
         .env("PI_CODING_AGENT_DIR", &pi_agent_dir)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(reuninstall.status.success());
@@ -823,6 +821,7 @@ fn verify_pi_extension_lifecycle(binary: &str, dir: &Path) {
     let refused = Command::new(binary)
         .args(["install", "pi"])
         .env("PI_CODING_AGENT_DIR", &pi_agent_dir)
+        .env("PATH", &path_env)
         .output()
         .unwrap();
     assert!(!refused.status.success());
@@ -831,6 +830,23 @@ fn verify_pi_extension_lifecycle(binary: &str, dir: &Path) {
         "// user-owned extension\n"
     );
     fs::remove_file(extension_path).unwrap();
+}
+
+fn test_path(dir: &Path) -> (PathBuf, std::ffi::OsString) {
+    let bin_dir = dir.join("path-bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let executable = bin_dir.join("harness-status");
+    fs::write(&executable, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let path_env = std::env::join_paths([bin_dir.as_path()]).unwrap();
+    (executable, path_env)
+}
+
+fn stale_build_command(dir: &Path, harness: &str) -> String {
+    format!(
+        "'{}/target/release/harness-status' hook {harness}",
+        dir.display()
+    )
 }
 
 fn send_hook(

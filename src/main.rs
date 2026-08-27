@@ -28,6 +28,7 @@ const CLAUDE_HOOK_EVENTS: [&str; 5] = [
 ];
 const CLAUDE_RETIRED_HOOK_EVENTS: [&str; 1] = ["SessionStart"];
 const NOTIFIER_TIMEOUT: Duration = Duration::from_secs(1);
+const HARNESS_STATUS_EXECUTABLE: &str = "harness-status";
 const LEGACY_CODEX_HOOK_COMMAND: &str = "harness-status hook codex";
 const LEGACY_CLAUDE_HOOK_COMMAND: &str = "harness-status hook claude";
 const PI_EXTENSION_FILE: &str = "harness-status.ts";
@@ -803,11 +804,19 @@ fn install_hooks(
     let hooks = hooks_object_mut(root, &display_path)?;
     let mut changed = false;
     for &event in events {
-        changed |= install_event_handler(hooks, event, &target_handler, &command, legacy_command)?;
+        changed |= install_event_handler(
+            hooks,
+            event,
+            &target_handler,
+            harness,
+            &command,
+            legacy_command,
+        )?;
     }
     changed |= remove_managed_events(
         hooks,
         retired_events,
+        harness,
         &command,
         legacy_command,
         &display_path,
@@ -861,7 +870,14 @@ fn uninstall_hooks(
             invalid_hook_config(&display_path, "top-level 'hooks' must be an object")
         })?;
         for list in [events, retired_events] {
-            changed |= remove_managed_events(hooks, list, &command, legacy_command, &display_path)?;
+            changed |= remove_managed_events(
+                hooks,
+                list,
+                harness,
+                &command,
+                legacy_command,
+                &display_path,
+            )?;
         }
         // Ours to drop only when our own removals emptied it. An object that
         // never held anything of ours is not ours to rewrite, and only a write
@@ -941,7 +957,7 @@ fn pi_extension_path() -> io::Result<PathBuf> {
 }
 
 fn installed_pi_extension() -> io::Result<Vec<u8>> {
-    let executable = env::current_exe()?;
+    let executable = path_executable()?;
     let executable = executable.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1023,7 +1039,7 @@ fn writable_config_path(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn hook_command(harness: &str) -> io::Result<String> {
-    let executable = env::current_exe()?;
+    let executable = path_executable()?;
     let executable = executable.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1031,6 +1047,34 @@ fn hook_command(harness: &str) -> io::Result<String> {
         )
     })?;
     Ok(format!("{} hook {harness}", shell_quote(executable)))
+}
+
+fn path_executable() -> io::Result<PathBuf> {
+    let path = env::var_os("PATH").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "cannot find 'harness-status': PATH is not set",
+        )
+    })?;
+    let current_dir = env::current_dir()?;
+    for directory in env::split_paths(&path) {
+        let candidate = if directory.as_os_str().is_empty() {
+            current_dir.join(HARNESS_STATUS_EXECUTABLE)
+        } else if directory.is_absolute() {
+            directory.join(HARNESS_STATUS_EXECUTABLE)
+        } else {
+            current_dir.join(directory).join(HARNESS_STATUS_EXECUTABLE)
+        };
+        if fs::metadata(&candidate)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "cannot find executable 'harness-status' on PATH",
+    ))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1071,6 +1115,7 @@ fn install_event_handler(
     hooks: &mut Map<String, Value>,
     event: &str,
     target_handler: &Value,
+    harness: &str,
     command: &str,
     legacy_command: &str,
 ) -> io::Result<bool> {
@@ -1091,13 +1136,13 @@ fn install_event_handler(
     let owned: Vec<&Value> = groups
         .iter()
         .flat_map(|group| group["hooks"].as_array().expect("validated hook group"))
-        .filter(|handler| handler_is_owned(handler, command, legacy_command))
+        .filter(|handler| handler_is_owned(handler, harness, command, legacy_command))
         .collect();
     if owned.len() == 1 && owned[0] == target_handler {
         return Ok(false);
     }
 
-    remove_owned_handlers(groups, event, command, legacy_command)?;
+    remove_owned_handlers(groups, event, harness, command, legacy_command)?;
     groups.push(json!({ "hooks": [target_handler.clone()] }));
     Ok(true)
 }
@@ -1105,6 +1150,7 @@ fn install_event_handler(
 fn remove_managed_events(
     hooks: &mut Map<String, Value>,
     events: &[&str],
+    harness: &str,
     command: &str,
     legacy_command: &str,
     display_path: &Path,
@@ -1118,7 +1164,7 @@ fn remove_managed_events(
         let groups = groups_value.as_array_mut().ok_or_else(|| {
             invalid_hook_config(display_path, &format!("hooks.{event} must be an array"))
         })?;
-        changed |= remove_owned_handlers(groups, event, command, legacy_command)? > 0;
+        changed |= remove_owned_handlers(groups, event, harness, command, legacy_command)? > 0;
         if groups.is_empty() {
             empty_events.push(event);
         }
@@ -1132,6 +1178,7 @@ fn remove_managed_events(
 fn remove_owned_handlers(
     groups: &mut Vec<Value>,
     event: &str,
+    harness: &str,
     command: &str,
     legacy_command: &str,
 ) -> io::Result<usize> {
@@ -1140,7 +1187,7 @@ fn remove_owned_handlers(
     for group in groups.iter_mut() {
         let handlers = group["hooks"].as_array_mut().expect("validated hook group");
         handlers.retain(|handler| {
-            if handler_is_owned(handler, command, legacy_command) {
+            if handler_is_owned(handler, harness, command, legacy_command) {
                 removed += 1;
                 false
             } else {
@@ -1173,12 +1220,30 @@ fn validate_event_groups(groups: &[Value], event: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn handler_is_owned(handler: &Value, command: &str, legacy_command: &str) -> bool {
+fn handler_is_owned(handler: &Value, harness: &str, command: &str, legacy_command: &str) -> bool {
     handler.get("type").and_then(Value::as_str) == Some("command")
         && handler
             .get("command")
             .and_then(Value::as_str)
-            .is_some_and(|candidate| candidate == command || candidate == legacy_command)
+            .is_some_and(|candidate| {
+                candidate == command
+                    || candidate == legacy_command
+                    || generated_hook_command(candidate, harness)
+            })
+}
+
+fn generated_hook_command(candidate: &str, harness: &str) -> bool {
+    let suffix = format!("' hook {harness}");
+    let Some(executable) = candidate
+        .strip_suffix(&suffix)
+        .and_then(|command| command.strip_prefix('\''))
+    else {
+        return false;
+    };
+    Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some(HARNESS_STATUS_EXECUTABLE)
 }
 
 fn invalid_hook_config(path: &Path, detail: &str) -> io::Error {

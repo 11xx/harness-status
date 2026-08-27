@@ -360,20 +360,24 @@ impl Registry {
             };
         }
 
-        let (state, reason) = match (harness, event.as_str()) {
-            ("codex" | "claude", "UserPromptSubmit") | ("pi", "AgentStart" | "ResumeWorking") => {
-                ("working", None)
+        // The third field separates the two ways a thread reaches `working`: a
+        // prompt opens a new turn, while a resume returns to one already under
+        // way and must leave its clock alone.
+        let (state, reason, begins_turn) = match (harness, event.as_str()) {
+            ("codex" | "claude", "UserPromptSubmit") | ("pi", "AgentStart") => {
+                ("working", None, true)
             }
+            ("pi", "ResumeWorking") => ("working", None, false),
             ("codex" | "claude", "Stop") | ("pi", "AgentSettled" | "ResumeCompleted") => {
-                ("completed", None)
+                ("completed", None, false)
             }
-            ("claude", "StopFailure") => ("attention", Some("failure")),
-            ("pi", "Attention") => ("attention", None),
+            ("claude", "StopFailure") => ("attention", Some("failure"), false),
+            ("pi", "Attention") => ("attention", None, false),
             ("claude", "Notification") => match notification_type.as_deref() {
-                Some("permission_prompt") => ("attention", Some("permission")),
-                Some("elicitation_dialog") => ("attention", Some("elicitation")),
-                Some("agent_needs_input") => ("attention", Some("subagent")),
-                Some("elicitation_complete" | "elicitation_response") => ("working", None),
+                Some("permission_prompt") => ("attention", Some("permission"), false),
+                Some("elicitation_dialog") => ("attention", Some("elicitation"), false),
+                Some("agent_needs_input") => ("attention", Some("subagent"), false),
+                Some("elicitation_complete" | "elicitation_response") => ("working", None, false),
                 _ => {
                     return HookResult {
                         changed: false,
@@ -394,7 +398,7 @@ impl Registry {
         let now = unix_time_seconds();
         let name = display_name(&cwd);
         let model = nonempty(model);
-        let starts_turn = state == "working";
+        let is_working = state == "working";
 
         if let Some(entry) = self
             .entries
@@ -417,14 +421,14 @@ impl Registry {
             }
             entry.status.reason = reason.map(str::to_owned);
             entry.status.background = background;
-            if starts_turn {
+            if begins_turn {
                 entry.status.started_at = Some(now);
             }
             entry.status.updated_at = now;
-            if starts_turn || owner.is_some() {
+            if is_working || owner.is_some() {
                 entry.owner = owner;
             }
-            if starts_turn || transcript.is_some() {
+            if is_working || transcript.is_some() {
                 entry.transcript = transcript;
             }
             let notification =
@@ -452,7 +456,7 @@ impl Registry {
                 turn_id,
                 reason: reason.map(str::to_owned),
                 background,
-                started_at: starts_turn.then_some(now),
+                started_at: begins_turn.then_some(now),
                 updated_at: now,
             },
             owner,
@@ -2002,6 +2006,39 @@ mod tests {
         registry.apply_hook("claude", event("UserPromptSubmit", None), None);
         assert!(registry.entries[0].status.reason.is_none());
         assert!(!registry.entries[0].status.background);
+    }
+
+    #[test]
+    fn only_a_new_prompt_restarts_the_reported_turn_clock() {
+        const BEGAN: u64 = 1_000;
+        let mut registry = Registry::default();
+
+        registry.apply_hook("claude", event("UserPromptSubmit", None), None);
+        registry.entries[0].status.started_at = Some(BEGAN);
+
+        // Answering a dialog resumes the turn that was already under way, so a
+        // bar keeps reporting how long that turn has run.
+        for resumed in ["elicitation_complete", "elicitation_response"] {
+            registry.apply_hook(
+                "claude",
+                event("Notification", Some("permission_prompt")),
+                None,
+            );
+            registry.apply_hook("claude", event("Notification", Some(resumed)), None);
+            assert_eq!(registry.entries[0].status.state, "working");
+            assert_eq!(registry.entries[0].status.started_at, Some(BEGAN));
+        }
+
+        // The next prompt is a new turn, and starts its clock over.
+        registry.apply_hook("claude", event("UserPromptSubmit", None), None);
+        assert!(registry.entries[0].status.started_at > Some(BEGAN));
+
+        let mut registry = Registry::default();
+        registry.apply_hook("pi", event("AgentStart", None), None);
+        registry.entries[0].status.started_at = Some(BEGAN);
+        registry.apply_hook("pi", event("Attention", None), None);
+        registry.apply_hook("pi", event("ResumeWorking", None), None);
+        assert_eq!(registry.entries[0].status.started_at, Some(BEGAN));
     }
 
     #[test]

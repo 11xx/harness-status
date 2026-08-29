@@ -105,6 +105,10 @@ remain present with their age. Missing data is `unavailable`, not zero. A
 Claude `429` honors `Retry-After` and otherwise backs off from three to six,
 twelve, and fifteen minutes.
 
+Each available window includes its absolute `resets_at` timestamp plus dynamic
+`resets_in_seconds` and compact `resets_in` countdowns. The compact bar remains
+percentage-only; hovering a provider shows when each window resets.
+
 With no harness name, snapshot and follow modes include every supported
 harness. Adding a harness name narrows the same JSON shape instead of creating a
 provider-specific contract.

@@ -73,6 +73,15 @@ struct StoredUsage {
 }
 
 #[derive(Serialize)]
+struct UsageWindowView {
+    used_percentage: u8,
+    remaining_percentage: u8,
+    resets_at: u64,
+    resets_in_seconds: u64,
+    resets_in: String,
+}
+
+#[derive(Serialize)]
 struct ProviderUsage {
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,9 +89,9 @@ struct ProviderUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     age_minutes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    five_hour: Option<UsageWindow>,
+    five_hour: Option<UsageWindowView>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    seven_day: Option<UsageWindow>,
+    seven_day: Option<UsageWindowView>,
 }
 
 #[derive(Serialize)]
@@ -961,7 +970,16 @@ fn ingest_usage(harness: &str) -> io::Result<()> {
     let path = usage_state_path()?;
     let mut cache = read_usage_cache(&path)?;
     let updated_at = stored.updated_at;
-    cache.claude = Some(stored);
+    let previous = cache.claude.take();
+    cache.claude = Some(StoredUsage {
+        updated_at,
+        five_hour: stored
+            .five_hour
+            .or_else(|| previous.as_ref().and_then(|usage| usage.five_hour.clone())),
+        seven_day: stored
+            .seven_day
+            .or_else(|| previous.and_then(|usage| usage.seven_day)),
+    });
     refresh_succeeded(&mut cache.refresh.claude, updated_at);
     write_usage_cache(&path, &cache)
 }
@@ -998,9 +1016,40 @@ fn provider_usage(stored: Option<StoredUsage>, now: u64) -> ProviderUsage {
         },
         updated_at: Some(stored.updated_at),
         age_minutes: Some(now.saturating_sub(stored.updated_at) / 60),
-        five_hour: stored.five_hour,
-        seven_day: stored.seven_day,
+        five_hour: stored
+            .five_hour
+            .map(|window| usage_window_view(window, now)),
+        seven_day: stored
+            .seven_day
+            .map(|window| usage_window_view(window, now)),
     }
+}
+
+fn usage_window_view(window: UsageWindow, now: u64) -> UsageWindowView {
+    let resets_in_seconds = window.resets_at.saturating_sub(now);
+    UsageWindowView {
+        used_percentage: window.used_percentage,
+        remaining_percentage: window.remaining_percentage,
+        resets_at: window.resets_at,
+        resets_in_seconds,
+        resets_in: format_reset_in(resets_in_seconds),
+    }
+}
+
+fn format_reset_in(seconds: u64) -> String {
+    if seconds == 0 {
+        return "now".to_owned();
+    }
+    let minutes = seconds.saturating_add(59) / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    if hours < 24 {
+        return format!("{hours}h{remaining_minutes:02}m");
+    }
+    format!("{}d{}h", hours / 24, hours % 24)
 }
 
 fn usage_state_path() -> io::Result<PathBuf> {
@@ -2599,6 +2648,16 @@ mod tests {
             parse_retry_after("2033-05-18T03:33:19Z", 1_999_999_000),
             Some(999)
         );
+    }
+
+    #[test]
+    fn usage_reset_countdowns_are_compact_and_never_round_to_zero_early() {
+        assert_eq!(format_reset_in(0), "now");
+        assert_eq!(format_reset_in(1), "1m");
+        assert_eq!(format_reset_in(60), "1m");
+        assert_eq!(format_reset_in(61), "2m");
+        assert_eq!(format_reset_in(3_661), "1h02m");
+        assert_eq!(format_reset_in(90_000), "1d1h");
     }
 
     fn event(name: &str, notification_type: Option<&str>) -> HookEvent {

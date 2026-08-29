@@ -186,9 +186,39 @@ printf '\n__HARNESS_STATUS_HTTP__200|'
     assert_eq!(first["codex"]["seven_day"]["remaining_percentage"], 59);
     assert_eq!(first["claude"]["five_hour"]["remaining_percentage"], 76);
     assert_eq!(first["claude"]["seven_day"]["remaining_percentage"], 88);
+    assert!(first["codex"]["five_hour"]["resets_in_seconds"].is_u64());
+    assert!(first["codex"]["five_hour"]["resets_in"].is_string());
+
+    let sparse = json!({
+        "rate_limits": {
+            "seven_day": {"used_percentage": 13, "resets_at": 1_999_999_999_u64}
+        }
+    });
+    let mut ingest = Command::new(binary)
+        .args(["usage", "ingest", "claude"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    ingest
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(sparse.to_string().as_bytes())
+        .unwrap();
+    assert!(ingest.wait().unwrap().success());
 
     let second = run();
     assert!(second.status.success());
+    let second_report: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(
+        second_report["claude"]["five_hour"]["remaining_percentage"],
+        76
+    );
+    assert_eq!(
+        second_report["claude"]["seven_day"]["remaining_percentage"],
+        87
+    );
     assert_eq!(fs::read_to_string(&codex_calls).unwrap().lines().count(), 1);
     let curl_args = fs::read_to_string(&curl_args).unwrap();
     assert_eq!(

@@ -88,14 +88,22 @@ harness-status usage ingest claude
 ```
 
 `harness-status usage` prints one normalized account-window report for Codex
-and Claude. Codex windows come from rate-limit metadata already stored in local
-session events. Claude supplies the same data to its status-line process during
-normal turns; a status line can pass that payload to `harness-status usage
-ingest claude`, which stores only the two window percentages and reset times in
-a user-private runtime file. Neither path starts a model request or reads
-credentials. A provider observation older than one hour is `stale`; its last
-known values remain present with their age. Missing data is `unavailable`, not
-zero.
+and Claude. It asks Codex's supported app-server `account/rateLimits/read`
+method and Claude's read-only OAuth usage endpoint for fresh values at most once
+every three minutes. Claude's endpoint is not a public API; the command reads
+the existing unexpired Claude access token, sends it to Anthropic through
+`curl` standard input, and never refreshes, rewrites, logs, or places it in a
+process argument. Neither provider refresh starts a model request.
+
+Normal client activity remains the fastest update path. Codex session events
+seed the report when the app server is unavailable, while Claude's status line
+passes its already-delivered payload to `harness-status usage ingest claude`.
+The cache and provider refresh deadlines live in a user-private runtime file,
+and an advisory lock coalesces concurrent readers across bars and reloads. A
+provider observation older than five minutes is `stale`; its last known values
+remain present with their age. Missing data is `unavailable`, not zero. A
+Claude `429` honors `Retry-After` and otherwise backs off from three to six,
+twelve, and fifteen minutes.
 
 With no harness name, snapshot and follow modes include every supported
 harness. Adding a harness name narrows the same JSON shape instead of creating a
@@ -366,9 +374,10 @@ and [Claude](https://svgl.app/library/claude-ai-icon.svg) assets, recolored to
 muted neutral and brand tones that remain visible on light and dark bars. A
 middle dot separates the two windows, while the percent sign is visually
 subordinate to the values. Its tooltip also
-states provider freshness and observation age. The module owns one 30-minute
-`defpoll`, so multiple widget instances consume the same JSON value without
-starting one process per provider or bar.
+states provider freshness and observation age. The module rereads the local
+report every 30 seconds; the command's shared persisted schedule keeps actual
+provider requests at least three minutes apart. Multiple widget instances
+consume the same JSON value without starting one request per provider or bar.
 
 All adapters share the same semantic working/completed/attention classes, so pi
 stays consistent with the other Eww indicators. Glyph choices live entirely in

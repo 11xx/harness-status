@@ -22,10 +22,10 @@
   :initial "{\"threads\":[]}"
   "harness-status pi --follow")
 
-;; Account windows arrive through normal client activity. One daemon-wide poll
-;; reads those local observations for every widget that renders them.
+;; One daemon-wide poll reads the shared cache; the command coalesces active
+;; provider refreshes behind persisted three-minute deadlines.
 (defpoll harness-usage-json
-  :interval "30m"
+  :interval "30s"
   :initial "{\"updated_at\":0,\"state\":\"unavailable\",\"codex\":{\"state\":\"unavailable\"},\"claude\":{\"state\":\"unavailable\"}}"
   "harness-status usage")
 

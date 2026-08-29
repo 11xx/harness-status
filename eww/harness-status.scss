@@ -22,3 +22,15 @@
   opacity: 0.55;
   font-size: 0.8em;
 }
+
+.harness-usage {
+  padding: 0 4px;
+}
+
+.harness-usage__provider--stale {
+  opacity: 0.65;
+}
+
+.harness-usage__provider--unavailable {
+  opacity: 0.45;
+}

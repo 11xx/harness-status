@@ -13,6 +13,91 @@ struct Follower {
     dir: PathBuf,
 }
 
+#[test]
+fn usage_report_normalizes_local_codex_and_claude_windows() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-usage-test-{nonce}"));
+    let codex_home = dir.join("codex");
+    let sessions = codex_home.join("sessions/2026/08/29");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("rollout.jsonl"),
+        format!(
+            "{}\n",
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "primary": {"used_percent": 22.4, "resets_at": 1787985293_u64},
+                        "secondary": {"used_percent": 35.0, "resets_at": 1788458808_u64}
+                    }
+                }
+            })
+        ),
+    )
+    .unwrap();
+    let socket = dir.join("status.sock");
+
+    let unavailable = Command::new(binary)
+        .arg("usage")
+        .env("CODEX_HOME", &codex_home)
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(unavailable.status.success());
+    let unavailable: Value = serde_json::from_slice(&unavailable.stdout).unwrap();
+    assert_eq!(unavailable["codex"]["five_hour"]["used_percentage"], 22);
+    assert_eq!(unavailable["claude"]["state"], "unavailable");
+    assert_eq!(unavailable["state"], "stale");
+
+    let payload = json!({
+        "rate_limits": {
+            "five_hour": {"used_percentage": 47.6, "resets_at": 1787985300_u64},
+            "seven_day": {"used_percentage": 61, "resets_at": 1788458900_u64}
+        }
+    });
+    let mut ingest = Command::new(binary)
+        .args(["usage", "ingest", "claude"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    ingest
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    assert!(ingest.wait().unwrap().success());
+
+    let report = Command::new(binary)
+        .arg("usage")
+        .env("CODEX_HOME", &codex_home)
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(report.status.success());
+    let report: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report["state"], "fresh");
+    assert_eq!(report["claude"]["five_hour"]["used_percentage"], 48);
+    assert_eq!(report["claude"]["seven_day"]["used_percentage"], 61);
+    assert_eq!(
+        fs::metadata(dir.join("harness-status-usage.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
 impl Drop for Follower {
     fn drop(&mut self) {
         let _ = self.child.kill();

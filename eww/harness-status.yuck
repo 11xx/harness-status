@@ -22,6 +22,13 @@
   :initial "{\"threads\":[]}"
   "harness-status pi --follow")
 
+;; Account windows arrive through normal client activity. One daemon-wide poll
+;; reads those local observations for every widget that renders them.
+(defpoll harness-usage-json
+  :interval "30m"
+  :initial "{\"updated_at\":0,\"state\":\"unavailable\",\"codex\":{\"state\":\"unavailable\"},\"claude\":{\"state\":\"unavailable\"}}"
+  "harness-status usage")
+
 ;; One thread of one harness. A running thread shows the harness spinner, a
 ;; settled one shows `glyph`, and one that wants the user shows why.
 (defwidget harness-status-thread [thread spinner glyph]
@@ -73,3 +80,17 @@
         :thread thread
         :spinner harness-status-pi-spinner
         :glyph "π"))))
+
+(defwidget harness-usage-provider [provider glyph]
+  (label
+    :class "harness-usage__provider harness-usage__provider--${provider.state}"
+    :tooltip "${glyph == "C" ? "Codex" : "Claude"}: ${provider.state} · 5h ${provider?.five_hour?.used_percentage ?: "?"}% · 7d ${provider?.seven_day?.used_percentage ?: "?"}% · as of ${provider?.age_minutes ?: "?"}m ago"
+    :text "${provider.state == "stale" ? "~" : ""}${glyph} ${provider?.five_hour?.used_percentage ?: "?"}/${provider?.seven_day?.used_percentage ?: "?"}%"))
+
+(defwidget harness-usage []
+  (box
+    :class "harness-usage harness-usage--${harness-usage-json.state}"
+    :space-evenly false
+    :spacing 5
+    (harness-usage-provider :provider {harness-usage-json.codex} :glyph "C")
+    (harness-usage-provider :provider {harness-usage-json.claude} :glyph "✻")))

@@ -35,6 +35,8 @@ const PI_EXTENSION_FILE: &str = "harness-status.ts";
 const PI_EXTENSION_MARKER: &str =
     "// Managed by harness-status. Reinstall instead of editing this file.\n";
 const PI_EXTENSION_SOURCE: &str = include_str!("../pi/harness-status.ts");
+const USAGE_FRESH_SECONDS: u64 = 60 * 60;
+const USAGE_STATE_FILE: &str = "harness-status-usage.json";
 
 #[derive(Debug)]
 enum Action {
@@ -44,8 +46,46 @@ enum Action {
     Ack { id: String },
     Install { harness: String },
     Uninstall { harness: String },
+    Usage,
+    UsageIngest { harness: String },
     Help,
     Version,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct UsageWindow {
+    used_percentage: u8,
+    resets_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StoredUsage {
+    updated_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    five_hour: Option<UsageWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seven_day: Option<UsageWindow>,
+}
+
+#[derive(Serialize)]
+struct ProviderUsage {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    five_hour: Option<UsageWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seven_day: Option<UsageWindow>,
+}
+
+#[derive(Serialize)]
+struct UsageReport {
+    updated_at: u64,
+    state: &'static str,
+    codex: ProviderUsage,
+    claude: ProviderUsage,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -628,6 +668,8 @@ fn main() {
         Action::Ack { id } => acknowledge(&id),
         Action::Install { harness } => install_integration(&harness),
         Action::Uninstall { harness } => uninstall_integration(&harness),
+        Action::Usage => print_usage_report(),
+        Action::UsageIngest { harness } => ingest_usage(&harness),
         Action::Help => {
             print_help();
             Ok(())
@@ -677,6 +719,16 @@ fn parse_args() -> Result<Action, String> {
                 .ok_or_else(|| "'uninstall' requires a harness name".to_owned())?;
             no_more_args(args, Action::Uninstall { harness })
         }
+        "usage" => match args.next().as_deref() {
+            None => Ok(Action::Usage),
+            Some("ingest") => {
+                let harness = args
+                    .next()
+                    .ok_or_else(|| "'usage ingest' requires a harness name".to_owned())?;
+                no_more_args(args, Action::UsageIngest { harness })
+            }
+            Some(other) => Err(format!("unexpected argument '{other}'")),
+        },
         "-f" | "--follow" => {
             let harness = args.next();
             no_more_args(args, Action::Follow { harness })
@@ -712,6 +764,8 @@ Usage:
   harness-status ack THREAD_ID
   harness-status install HARNESS
   harness-status uninstall HARNESS
+  harness-status usage
+  harness-status usage ingest claude
 
 Print an in-memory AI harness status snapshot as JSON, or stream changed
 snapshots as JSONL. With no HARNESS, snapshot and follow modes include all
@@ -722,6 +776,8 @@ Commands:
   ack THREAD_ID       Remove a thread from the current registry
   install HARNESS     Install the harness integration in its user config
   uninstall HARNESS   Remove the harness integration from its user config
+  usage               Print normalized Codex and Claude account windows
+  usage ingest claude Store sanitized windows from a Claude status payload
 
 Options:
   -f, --follow       Own or subscribe to the registry and print changed JSON
@@ -781,6 +837,200 @@ fn unsupported_harness(harness: &str) -> io::Error {
         io::ErrorKind::InvalidInput,
         format!("unsupported harness '{harness}'"),
     )
+}
+
+fn print_usage_report() -> io::Result<()> {
+    let now = unix_time_seconds();
+    let codex = provider_usage(read_codex_usage()?, now);
+    let claude = provider_usage(read_stored_usage(&usage_state_path()?)?, now);
+    let state = match (codex.state, claude.state) {
+        ("fresh", "fresh") => "fresh",
+        ("unavailable", "unavailable") => "unavailable",
+        _ => "stale",
+    };
+    let report = UsageReport {
+        updated_at: now,
+        state,
+        codex,
+        claude,
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&report).map_err(io::Error::other)?
+    );
+    Ok(())
+}
+
+fn ingest_usage(harness: &str) -> io::Result<()> {
+    if harness != "claude" {
+        return Err(unsupported_harness(harness));
+    }
+    let input: Value = match serde_json::from_reader(io::stdin().lock()) {
+        Ok(input) => input,
+        Err(_) => return Ok(()),
+    };
+    let Some(rate_limits) = input.get("rate_limits") else {
+        return Ok(());
+    };
+    let stored = StoredUsage {
+        updated_at: unix_time_seconds(),
+        five_hour: parse_usage_window(rate_limits.get("five_hour")),
+        seven_day: parse_usage_window(
+            rate_limits
+                .get("seven_day")
+                .or_else(|| rate_limits.get("weekly")),
+        ),
+    };
+    if stored.five_hour.is_none() && stored.seven_day.is_none() {
+        return Ok(());
+    }
+    let mut contents = serde_json::to_vec(&stored).map_err(io::Error::other)?;
+    contents.push(b'\n');
+    write_bytes_atomic(&usage_state_path()?, &contents, ".harness-status-usage")
+}
+
+fn parse_usage_window(value: Option<&Value>) -> Option<UsageWindow> {
+    let value = value?;
+    let percentage = value.get("used_percentage")?.as_f64()?;
+    let resets_at = value.get("resets_at")?.as_u64()?;
+    if !(0.0..=100.0).contains(&percentage) || resets_at == 0 {
+        return None;
+    }
+    Some(UsageWindow {
+        used_percentage: percentage.round() as u8,
+        resets_at,
+    })
+}
+
+fn provider_usage(stored: Option<StoredUsage>, now: u64) -> ProviderUsage {
+    let Some(stored) = stored else {
+        return ProviderUsage {
+            state: "unavailable",
+            updated_at: None,
+            age_minutes: None,
+            five_hour: None,
+            seven_day: None,
+        };
+    };
+    ProviderUsage {
+        state: if now.saturating_sub(stored.updated_at) <= USAGE_FRESH_SECONDS {
+            "fresh"
+        } else {
+            "stale"
+        },
+        updated_at: Some(stored.updated_at),
+        age_minutes: Some(now.saturating_sub(stored.updated_at) / 60),
+        five_hour: stored.five_hour,
+        seven_day: stored.seven_day,
+    }
+}
+
+fn usage_state_path() -> io::Result<PathBuf> {
+    let socket = socket_path()?;
+    Ok(socket
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join(USAGE_STATE_FILE))
+}
+
+fn read_stored_usage(path: &Path) -> io::Result<Option<StoredUsage>> {
+    match fs::read(path) {
+        Ok(contents) => Ok(serde_json::from_slice(&contents).ok()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_codex_usage() -> io::Result<Option<StoredUsage>> {
+    let root = codex_home()?.join("sessions");
+    let mut files = Vec::new();
+    collect_jsonl_files(&root, &mut files)?;
+    files.sort_unstable_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    for path in files.into_iter().rev() {
+        if let Some(usage) = read_codex_session_usage(&path)? {
+            return Ok(Some(usage));
+        }
+    }
+    Ok(None)
+}
+
+fn collect_jsonl_files(path: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_jsonl_files(&path, files)?;
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn read_codex_session_usage(path: &Path) -> io::Result<Option<StoredUsage>> {
+    let file = fs::File::open(path)?;
+    let mut found = None;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(rate_limits) = record
+            .get("payload")
+            .and_then(|payload| payload.get("rate_limits"))
+        else {
+            continue;
+        };
+        let five_hour = parse_codex_window(rate_limits.get("primary"));
+        let seven_day = parse_codex_window(rate_limits.get("secondary"));
+        if five_hour.is_some() || seven_day.is_some() {
+            found = Some(StoredUsage {
+                updated_at: fs::metadata(path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map_or_else(unix_time_seconds, |duration| duration.as_secs()),
+                five_hour,
+                seven_day,
+            });
+        }
+    }
+    Ok(found)
+}
+
+fn parse_codex_window(value: Option<&Value>) -> Option<UsageWindow> {
+    let value = value?;
+    let percentage = value.get("used_percent")?.as_f64()?;
+    let resets_at = value.get("resets_at")?.as_u64()?;
+    if !(0.0..=100.0).contains(&percentage) || resets_at == 0 {
+        return None;
+    }
+    Some(UsageWindow {
+        used_percentage: percentage.round() as u8,
+        resets_at,
+    })
+}
+
+fn codex_home() -> io::Result<PathBuf> {
+    if let Some(path) = env::var_os("CODEX_HOME").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(path).join(".codex"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
 }
 
 fn install_hooks(

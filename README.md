@@ -83,7 +83,19 @@ harness-status install claude
 harness-status uninstall claude
 harness-status install pi
 harness-status uninstall pi
+harness-status usage
+harness-status usage ingest claude
 ```
+
+`harness-status usage` prints one normalized account-window report for Codex
+and Claude. Codex windows come from rate-limit metadata already stored in local
+session events. Claude supplies the same data to its status-line process during
+normal turns; a status line can pass that payload to `harness-status usage
+ingest claude`, which stores only the two window percentages and reset times in
+a user-private runtime file. Neither path starts a model request or reads
+credentials. A provider observation older than one hour is `stale`; its last
+known values remain present with their age. Missing data is `unavailable`, not
+zero.
 
 With no harness name, snapshot and follow modes include every supported
 harness. Adding a harness name narrows the same JSON shape instead of creating a
@@ -319,6 +331,7 @@ Place the exported widget wherever indicators should appear:
 (harness-status-codex)
 (harness-status-claude)
 (harness-status-pi)
+(harness-usage :assets "./modules/harness-status/assets")
 ```
 
 The module defines no window or bar and assumes no window manager, monitor,
@@ -343,6 +356,16 @@ carries a trailing `⋯`. The tooltip names the project, the state or the reason
 it wants the user, the model, and the turn's `duration` as the stream already
 formatted it, so the module needs no timer or clock variable of its own.
 Clicking any state acknowledges the indicator.
+
+The separate `harness-usage` widget shows each provider's SVG mark followed by
+its five-hour and seven-day percentages. A leading `~` and reduced opacity mark retained
+stale values; question marks mark unavailable windows. Percentages count the
+remaining allowance down from 100 to 0, and the tooltip labels them as left.
+The provider icons are SVGL's [Codex](https://svgl.app/library/codex_dark.svg)
+and [Claude](https://svgl.app/library/claude-ai-icon.svg) assets. Its tooltip also
+states provider freshness and observation age. The module owns one 30-minute
+`defpoll`, so multiple widget instances consume the same JSON value without
+starting one process per provider or bar.
 
 All adapters share the same semantic working/completed/attention classes, so pi
 stays consistent with the other Eww indicators. Glyph choices live entirely in

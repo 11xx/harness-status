@@ -66,6 +66,8 @@ struct UsageWindow {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredUsage {
     updated_at: u64,
+    #[serde(default)]
+    authoritative: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     five_hour: Option<UsageWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -907,7 +909,8 @@ fn print_usage_report() -> io::Result<()> {
             changed = true;
             match refresh_claude_usage(now) {
                 Ok(usage) => {
-                    cache.claude = Some(usage);
+                    let previous = cache.claude.take();
+                    cache.claude = Some(merge_usage(usage, previous));
                     refresh_succeeded(&mut cache.refresh.claude, now);
                 }
                 Err(error) => refresh_failed(&mut cache.refresh.claude, now, error),
@@ -954,6 +957,7 @@ fn ingest_usage(harness: &str) -> io::Result<()> {
     };
     let stored = StoredUsage {
         updated_at: unix_time_seconds(),
+        authoritative: false,
         five_hour: parse_usage_window(rate_limits.get("five_hour")),
         seven_day: parse_usage_window(
             rate_limits
@@ -969,19 +973,39 @@ fn ingest_usage(harness: &str) -> io::Result<()> {
     };
     let path = usage_state_path()?;
     let mut cache = read_usage_cache(&path)?;
-    let updated_at = stored.updated_at;
-    let previous = cache.claude.take();
-    cache.claude = Some(StoredUsage {
-        updated_at,
-        five_hour: stored
-            .five_hour
-            .or_else(|| previous.as_ref().and_then(|usage| usage.five_hour.clone())),
-        seven_day: stored
-            .seven_day
-            .or_else(|| previous.and_then(|usage| usage.seven_day)),
-    });
-    refresh_succeeded(&mut cache.refresh.claude, updated_at);
+    cache.claude = Some(merge_usage(stored, cache.claude.take()));
     write_usage_cache(&path, &cache)
+}
+
+fn merge_usage(incoming: StoredUsage, previous: Option<StoredUsage>) -> StoredUsage {
+    let preserve_authoritative_previous = previous
+        .as_ref()
+        .is_some_and(|usage| usage.authoritative && !incoming.authoritative);
+    StoredUsage {
+        updated_at: incoming.updated_at,
+        authoritative: incoming.authoritative
+            || previous.as_ref().is_some_and(|usage| usage.authoritative),
+        five_hour: if preserve_authoritative_previous {
+            previous
+                .as_ref()
+                .and_then(|usage| usage.five_hour.clone())
+                .or(incoming.five_hour)
+        } else {
+            incoming
+                .five_hour
+                .or_else(|| previous.as_ref().and_then(|usage| usage.five_hour.clone()))
+        },
+        seven_day: if preserve_authoritative_previous {
+            previous
+                .as_ref()
+                .and_then(|usage| usage.seven_day.clone())
+                .or(incoming.seven_day)
+        } else {
+            incoming
+                .seven_day
+                .or_else(|| previous.and_then(|usage| usage.seven_day))
+        },
+    }
 }
 
 fn parse_usage_window(value: Option<&Value>) -> Option<UsageWindow> {
@@ -1188,6 +1212,7 @@ fn refresh_codex_usage(now: u64) -> Result<StoredUsage, RefreshError> {
     }
     Ok(StoredUsage {
         updated_at: now,
+        authoritative: true,
         five_hour,
         seven_day,
     })
@@ -1286,6 +1311,7 @@ fn refresh_claude_usage(now: u64) -> Result<StoredUsage, RefreshError> {
     }
     Ok(StoredUsage {
         updated_at: now,
+        authoritative: true,
         five_hour,
         seven_day,
     })
@@ -1389,6 +1415,7 @@ fn read_codex_session_usage(path: &Path) -> io::Result<Option<StoredUsage>> {
                     .ok()
                     .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
                     .map_or_else(unix_time_seconds, |duration| duration.as_secs()),
+                authoritative: true,
                 five_hour,
                 seven_day,
             });

@@ -152,7 +152,7 @@ done
         r##"#!/bin/sh
 printf '%s\n' "$*" >>"$FAKE_CURL_ARGS"
 cat >/dev/null
-printf '%s' '{"five_hour":{"utilization":24,"resets_at":"2033-05-18T03:33:19Z"},"seven_day":{"utilization":12,"resets_at":"2033-05-18T03:33:19Z"}}'
+printf '%s' '{"five_hour":{"utilization":100,"resets_at":"2033-05-18T03:33:19Z"},"seven_day":{"utilization":13,"resets_at":"2033-05-18T03:33:19Z"}}'
 printf '\n__HARNESS_STATUS_HTTP__200|'
 "##,
     )
@@ -184,8 +184,8 @@ printf '\n__HARNESS_STATUS_HTTP__200|'
     let first: Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(first["codex"]["five_hour"]["remaining_percentage"], 44);
     assert_eq!(first["codex"]["seven_day"]["remaining_percentage"], 59);
-    assert_eq!(first["claude"]["five_hour"]["remaining_percentage"], 76);
-    assert_eq!(first["claude"]["seven_day"]["remaining_percentage"], 88);
+    assert_eq!(first["claude"]["five_hour"]["remaining_percentage"], 0);
+    assert_eq!(first["claude"]["seven_day"]["remaining_percentage"], 87);
     assert!(first["codex"]["five_hour"]["resets_in_seconds"].is_u64());
     assert!(first["codex"]["five_hour"]["resets_in"].is_string());
 
@@ -213,21 +213,59 @@ printf '\n__HARNESS_STATUS_HTTP__200|'
     let second_report: Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(
         second_report["claude"]["five_hour"]["remaining_percentage"],
-        76
+        0
     );
     assert_eq!(
         second_report["claude"]["seven_day"]["remaining_percentage"],
         87
     );
     assert_eq!(fs::read_to_string(&codex_calls).unwrap().lines().count(), 1);
-    let curl_args = fs::read_to_string(&curl_args).unwrap();
+    let curl_log = fs::read_to_string(&curl_args).unwrap();
     assert_eq!(
-        curl_args
+        curl_log
             .matches("https://api.anthropic.com/api/oauth/usage")
             .count(),
         1
     );
-    assert!(!curl_args.contains("test-secret-token"));
+    assert!(!curl_log.contains("test-secret-token"));
+
+    let cache_path = dir.join("harness-status-usage.json");
+    let mut cache: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+    cache["refresh"]["claude"]["next_at"] = json!(0);
+    fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+
+    let mut ingest = Command::new(binary)
+        .args(["usage", "ingest", "claude"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    ingest
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(sparse.to_string().as_bytes())
+        .unwrap();
+    assert!(ingest.wait().unwrap().success());
+
+    let third = run();
+    assert!(third.status.success());
+    let third_report: Value = serde_json::from_slice(&third.stdout).unwrap();
+    assert_eq!(
+        third_report["claude"]["five_hour"]["remaining_percentage"],
+        0
+    );
+    assert_eq!(
+        third_report["claude"]["seven_day"]["remaining_percentage"],
+        87
+    );
+    let curl_log = fs::read_to_string(&curl_args).unwrap();
+    assert_eq!(
+        curl_log
+            .matches("https://api.anthropic.com/api/oauth/usage")
+            .count(),
+        2
+    );
 
     fs::remove_dir_all(dir).unwrap();
 }

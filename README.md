@@ -98,6 +98,8 @@ process argument. Neither provider refresh starts a model request.
 Normal client activity remains the fastest update path. Codex session events
 seed the report when the app server is unavailable, while Claude's status line
 passes its already-delivered payload to `harness-status usage ingest claude`.
+Passive Claude payloads fill windows that are missing from the cache but do not
+overwrite complete values obtained from the authoritative usage endpoint.
 The cache and provider refresh deadlines live in a user-private runtime file,
 and an advisory lock coalesces concurrent readers across bars and reloads. A
 provider observation older than five minutes is `stale`; its last known values

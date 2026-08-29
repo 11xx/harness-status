@@ -362,7 +362,10 @@ its five-hour and seven-day percentages. A leading `~` and reduced opacity mark 
 stale values; question marks mark unavailable windows. Percentages count the
 remaining allowance down from 100 to 0, and the tooltip labels them as left.
 The provider icons are SVGL's [Codex](https://svgl.app/library/codex_dark.svg)
-and [Claude](https://svgl.app/library/claude-ai-icon.svg) assets. Its tooltip also
+and [Claude](https://svgl.app/library/claude-ai-icon.svg) assets, recolored to
+muted neutral and brand tones that remain visible on light and dark bars. A
+middle dot separates the two windows, while the percent sign is visually
+subordinate to the values. Its tooltip also
 states provider freshness and observation age. The module owns one 30-minute
 `defpoll`, so multiple widget instances consume the same JSON value without
 starting one process per provider or bar.

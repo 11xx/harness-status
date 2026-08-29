@@ -81,19 +81,25 @@
         :spinner harness-status-pi-spinner
         :glyph "π"))))
 
-(defwidget harness-usage-provider [provider name icon]
+(defwidget harness-usage-provider [provider name icon kind]
   (box
     :class "harness-usage__provider harness-usage__provider--${provider.state}"
     :tooltip "${name}: ${provider.state} · 5h ${provider?.five_hour?.remaining_percentage ?: "?"}% left · 7d ${provider?.seven_day?.remaining_percentage ?: "?"}% left · as of ${provider?.age_minutes ?: "?"}m ago"
     :space-evenly false
     :spacing 3
-    (image :path icon :image-width 13 :image-height 13)
-    (label :text "${provider.state == "stale" ? "~" : ""}${provider?.five_hour?.remaining_percentage ?: "?"}/${provider?.seven_day?.remaining_percentage ?: "?"}%")))
+    (image
+      :class "harness-usage__icon harness-usage__icon--${kind}"
+      :path icon
+      :fill-svg {kind == "codex" ? "#7B8082" : "#D97757"}
+      :image-width 13
+      :image-height 13)
+    (label :text "${provider.state == "stale" ? "~" : ""}${provider?.five_hour?.remaining_percentage ?: "?"}·${provider?.seven_day?.remaining_percentage ?: "?"}")
+    (label :class "harness-usage__percent" :text "%")))
 
 (defwidget harness-usage [assets]
   (box
     :class "harness-usage harness-usage--${harness-usage-json.state}"
     :space-evenly false
     :spacing 5
-    (harness-usage-provider :provider {harness-usage-json.codex} :name "Codex" :icon "${assets}/codex.svg")
-    (harness-usage-provider :provider {harness-usage-json.claude} :name "Claude" :icon "${assets}/claude.svg")))
+    (harness-usage-provider :provider {harness-usage-json.codex} :name "Codex" :kind "codex" :icon "${assets}/codex.svg")
+    (harness-usage-provider :provider {harness-usage-json.claude} :name "Claude" :kind "claude" :icon "${assets}/claude.svg")))

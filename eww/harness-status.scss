@@ -27,6 +27,18 @@
   padding: 0 4px;
 }
 
+.harness-usage__icon--codex {
+  opacity: 0.78;
+}
+
+.harness-usage__icon--claude {
+  opacity: 0.68;
+}
+
+.harness-usage__percent {
+  opacity: 0.5;
+}
+
 .harness-usage__provider--stale {
   opacity: 0.65;
 }

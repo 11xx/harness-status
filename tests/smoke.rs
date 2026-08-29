@@ -47,6 +47,7 @@ fn usage_report_normalizes_local_codex_and_claude_windows() {
         .arg("usage")
         .env("CODEX_HOME", &codex_home)
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_USAGE_REFRESH", "0")
         .output()
         .unwrap();
     assert!(unavailable.status.success());
@@ -83,6 +84,7 @@ fn usage_report_normalizes_local_codex_and_claude_windows() {
         .arg("usage")
         .env("CODEX_HOME", &codex_home)
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_USAGE_REFRESH", "0")
         .output()
         .unwrap();
     assert!(report.status.success());
@@ -99,6 +101,103 @@ fn usage_report_normalizes_local_codex_and_claude_windows() {
             & 0o777,
         0o600
     );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn usage_report_actively_refreshes_once_per_provider_interval() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-refresh-test-{nonce}"));
+    let bin_dir = dir.join("bin");
+    let claude_dir = dir.join("claude");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join(".credentials.json"),
+        json!({
+            "claudeAiOauth": {
+                "accessToken": "test-secret-token",
+                "expiresAt": 9_999_999_999_999_u64
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let codex = bin_dir.join("codex");
+    fs::write(
+        &codex,
+        r##"#!/bin/sh
+printf '%s\n' call >>"$FAKE_CODEX_CALLS"
+while IFS= read -r line; do
+  case "$line" in
+    *account/rateLimits/read*)
+      printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":56,"resetsAt":1999999999},"secondary":{"usedPercent":41,"resetsAt":1999999999}}}}'
+      ;;
+  esac
+done
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let curl = bin_dir.join("curl");
+    fs::write(
+        &curl,
+        r##"#!/bin/sh
+printf '%s\n' "$*" >>"$FAKE_CURL_ARGS"
+cat >/dev/null
+printf '%s' '{"five_hour":{"utilization":24,"resets_at":"2033-05-18T03:33:19Z"},"seven_day":{"utilization":12,"resets_at":"2033-05-18T03:33:19Z"}}'
+printf '\n__HARNESS_STATUS_HTTP__200|'
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let socket = dir.join("status.sock");
+    let codex_calls = dir.join("codex-calls");
+    let curl_args = dir.join("curl-args");
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = || {
+        Command::new(binary)
+            .arg("usage")
+            .env("PATH", &path)
+            .env("CLAUDE_CONFIG_DIR", &claude_dir)
+            .env("HARNESS_STATUS_SOCKET", &socket)
+            .env("FAKE_CODEX_CALLS", &codex_calls)
+            .env("FAKE_CURL_ARGS", &curl_args)
+            .output()
+            .unwrap()
+    };
+
+    let first = run();
+    assert!(first.status.success());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["codex"]["five_hour"]["remaining_percentage"], 44);
+    assert_eq!(first["codex"]["seven_day"]["remaining_percentage"], 59);
+    assert_eq!(first["claude"]["five_hour"]["remaining_percentage"], 76);
+    assert_eq!(first["claude"]["seven_day"]["remaining_percentage"], 88);
+
+    let second = run();
+    assert!(second.status.success());
+    assert_eq!(fs::read_to_string(&codex_calls).unwrap().lines().count(), 1);
+    let curl_args = fs::read_to_string(&curl_args).unwrap();
+    assert_eq!(
+        curl_args
+            .matches("https://api.anthropic.com/api/oauth/usage")
+            .count(),
+        1
+    );
+    assert!(!curl_args.contains("test-secret-token"));
 
     fs::remove_dir_all(dir).unwrap();
 }

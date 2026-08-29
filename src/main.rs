@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,8 +36,11 @@ const PI_EXTENSION_FILE: &str = "harness-status.ts";
 const PI_EXTENSION_MARKER: &str =
     "// Managed by harness-status. Reinstall instead of editing this file.\n";
 const PI_EXTENSION_SOURCE: &str = include_str!("../pi/harness-status.ts");
-const USAGE_FRESH_SECONDS: u64 = 60 * 60;
+const USAGE_FRESH_SECONDS: u64 = 5 * 60;
+const USAGE_REFRESH_SECONDS: u64 = 3 * 60;
+const USAGE_BACKOFF_MAX_SECONDS: u64 = 15 * 60;
 const USAGE_STATE_FILE: &str = "harness-status-usage.json";
+const USAGE_LOCK_FILE: &str = "harness-status-usage.lock";
 
 #[derive(Debug)]
 enum Action {
@@ -87,6 +91,37 @@ struct UsageReport {
     state: &'static str,
     codex: ProviderUsage,
     claude: ProviderUsage,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct UsageCache {
+    #[serde(default)]
+    codex: Option<StoredUsage>,
+    #[serde(default)]
+    claude: Option<StoredUsage>,
+    #[serde(default)]
+    refresh: RefreshSchedule,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct RefreshSchedule {
+    #[serde(default)]
+    codex: ProviderRefresh,
+    #[serde(default)]
+    claude: ProviderRefresh,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct ProviderRefresh {
+    #[serde(default)]
+    next_at: u64,
+    #[serde(default)]
+    failures: u8,
+}
+
+enum RefreshError {
+    RateLimited(Option<u64>),
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -842,8 +877,39 @@ fn unsupported_harness(harness: &str) -> io::Error {
 
 fn print_usage_report() -> io::Result<()> {
     let now = unix_time_seconds();
-    let codex = provider_usage(read_codex_usage()?, now);
-    let claude = provider_usage(read_stored_usage(&usage_state_path()?)?, now);
+    let path = usage_state_path()?;
+    let mut cache = read_usage_cache(&path)?;
+    if active_refresh_enabled()
+        && let Some(_lock) = try_usage_lock()?
+    {
+        cache = read_usage_cache(&path)?;
+        let mut changed = false;
+        if cache.refresh.codex.next_at <= now {
+            changed = true;
+            match refresh_codex_usage(now) {
+                Ok(usage) => {
+                    cache.codex = Some(usage);
+                    refresh_succeeded(&mut cache.refresh.codex, now);
+                }
+                Err(error) => refresh_failed(&mut cache.refresh.codex, now, error),
+            }
+        }
+        if cache.refresh.claude.next_at <= now {
+            changed = true;
+            match refresh_claude_usage(now) {
+                Ok(usage) => {
+                    cache.claude = Some(usage);
+                    refresh_succeeded(&mut cache.refresh.claude, now);
+                }
+                Err(error) => refresh_failed(&mut cache.refresh.claude, now, error),
+            }
+        }
+        if changed {
+            write_usage_cache(&path, &cache)?;
+        }
+    }
+    let codex = provider_usage(cache.codex.or(read_codex_usage()?), now);
+    let claude = provider_usage(cache.claude, now);
     let state = match (codex.state, claude.state) {
         ("fresh", "fresh") => "fresh",
         ("unavailable", "unavailable") => "unavailable",
@@ -860,6 +926,10 @@ fn print_usage_report() -> io::Result<()> {
         serde_json::to_string(&report).map_err(io::Error::other)?
     );
     Ok(())
+}
+
+fn active_refresh_enabled() -> bool {
+    env::var_os("HARNESS_STATUS_USAGE_REFRESH").as_deref() != Some(std::ffi::OsStr::new("0"))
 }
 
 fn ingest_usage(harness: &str) -> io::Result<()> {
@@ -885,9 +955,15 @@ fn ingest_usage(harness: &str) -> io::Result<()> {
     if stored.five_hour.is_none() && stored.seven_day.is_none() {
         return Ok(());
     }
-    let mut contents = serde_json::to_vec(&stored).map_err(io::Error::other)?;
-    contents.push(b'\n');
-    write_bytes_atomic(&usage_state_path()?, &contents, ".harness-status-usage")
+    let Some(_lock) = try_usage_lock()? else {
+        return Ok(());
+    };
+    let path = usage_state_path()?;
+    let mut cache = read_usage_cache(&path)?;
+    let updated_at = stored.updated_at;
+    cache.claude = Some(stored);
+    refresh_succeeded(&mut cache.refresh.claude, updated_at);
+    write_usage_cache(&path, &cache)
 }
 
 fn parse_usage_window(value: Option<&Value>) -> Option<UsageWindow> {
@@ -935,12 +1011,272 @@ fn usage_state_path() -> io::Result<PathBuf> {
         .join(USAGE_STATE_FILE))
 }
 
-fn read_stored_usage(path: &Path) -> io::Result<Option<StoredUsage>> {
+fn usage_lock_path() -> io::Result<PathBuf> {
+    let socket = socket_path()?;
+    Ok(socket
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join(USAGE_LOCK_FILE))
+}
+
+fn try_usage_lock() -> io::Result<Option<fs::File>> {
+    let path = usage_lock_path()?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+fn read_usage_cache(path: &Path) -> io::Result<UsageCache> {
     match fs::read(path) {
-        Ok(contents) => Ok(serde_json::from_slice(&contents).ok()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Ok(contents) => {
+            if let Ok(cache) = serde_json::from_slice(&contents) {
+                return Ok(cache);
+            }
+            let claude = serde_json::from_slice(&contents).ok();
+            Ok(UsageCache {
+                claude,
+                ..UsageCache::default()
+            })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(UsageCache::default()),
         Err(error) => Err(error),
     }
+}
+
+fn write_usage_cache(path: &Path, cache: &UsageCache) -> io::Result<()> {
+    let mut contents = serde_json::to_vec(cache).map_err(io::Error::other)?;
+    contents.push(b'\n');
+    write_bytes_atomic(path, &contents, ".harness-status-usage")
+}
+
+fn refresh_succeeded(refresh: &mut ProviderRefresh, now: u64) {
+    refresh.next_at = now + USAGE_REFRESH_SECONDS;
+    refresh.failures = 0;
+}
+
+fn refresh_failed(refresh: &mut ProviderRefresh, now: u64, error: RefreshError) {
+    refresh.failures = refresh.failures.saturating_add(1);
+    let exponential = USAGE_REFRESH_SECONDS
+        .saturating_mul(1_u64 << u32::from(refresh.failures.saturating_sub(1).min(8)))
+        .min(USAGE_BACKOFF_MAX_SECONDS);
+    refresh.next_at = now
+        + match error {
+            RefreshError::RateLimited(Some(retry_after)) => retry_after.max(exponential),
+            RefreshError::RateLimited(None) => exponential,
+            RefreshError::Unavailable => USAGE_REFRESH_SECONDS,
+        };
+}
+
+fn refresh_codex_usage(now: u64) -> Result<StoredUsage, RefreshError> {
+    let mut child = Command::new("codex")
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| RefreshError::Unavailable)?;
+    let mut stdin = child.stdin.take().ok_or(RefreshError::Unavailable)?;
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "harness-status",
+                    "title": "harness-status",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {}
+            }
+        })
+    )
+    .map_err(|_| RefreshError::Unavailable)?;
+    writeln!(stdin, "{}", json!({"method": "initialized", "params": {}}))
+        .map_err(|_| RefreshError::Unavailable)?;
+    writeln!(
+        stdin,
+        "{}",
+        json!({"method": "account/rateLimits/read", "id": 2})
+    )
+    .map_err(|_| RefreshError::Unavailable)?;
+    stdin.flush().map_err(|_| RefreshError::Unavailable)?;
+
+    let stdout = child.stdout.take().ok_or(RefreshError::Unavailable)?;
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value.get("id").and_then(Value::as_u64) == Some(2) {
+                let _ = sender.send(value);
+                return;
+            }
+        }
+    });
+    let response = receiver.recv_timeout(Duration::from_secs(5));
+    let _ = child.kill();
+    let _ = child.wait();
+    let response = response.map_err(|_| RefreshError::Unavailable)?;
+    let limits = response
+        .pointer("/result/rateLimits")
+        .ok_or(RefreshError::Unavailable)?;
+    let five_hour = parse_active_window(limits.get("primary"));
+    let seven_day = parse_active_window(limits.get("secondary"));
+    if five_hour.is_none() && seven_day.is_none() {
+        return Err(RefreshError::Unavailable);
+    }
+    Ok(StoredUsage {
+        updated_at: now,
+        five_hour,
+        seven_day,
+    })
+}
+
+fn parse_active_window(value: Option<&Value>) -> Option<UsageWindow> {
+    let value = value?;
+    usage_window(
+        value.get("usedPercent")?.as_f64()?,
+        value.get("resetsAt")?.as_u64()?,
+    )
+}
+
+fn refresh_claude_usage(now: u64) -> Result<StoredUsage, RefreshError> {
+    let credentials_path = claude_config_dir()
+        .map_err(|_| RefreshError::Unavailable)?
+        .join(".credentials.json");
+    let credentials: Value =
+        serde_json::from_slice(&fs::read(credentials_path).map_err(|_| RefreshError::Unavailable)?)
+            .map_err(|_| RefreshError::Unavailable)?;
+    let oauth = credentials
+        .get("claudeAiOauth")
+        .ok_or(RefreshError::Unavailable)?;
+    let token = oauth
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .filter(|token| {
+            !token.is_empty()
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        })
+        .ok_or(RefreshError::Unavailable)?;
+    if oauth
+        .get("expiresAt")
+        .and_then(Value::as_u64)
+        .is_some_and(|expires_at_ms| expires_at_ms / 1000 <= now)
+    {
+        return Err(RefreshError::Unavailable);
+    }
+
+    let mut child = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "10",
+            "--config",
+            "-",
+            "--write-out",
+            "\n__HARNESS_STATUS_HTTP__%{http_code}|%header{retry-after}",
+            "https://api.anthropic.com/api/oauth/usage",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| RefreshError::Unavailable)?;
+    let mut stdin = child.stdin.take().ok_or(RefreshError::Unavailable)?;
+    writeln!(stdin, "header = \"Authorization: Bearer {token}\"")
+        .map_err(|_| RefreshError::Unavailable)?;
+    writeln!(stdin, "header = \"anthropic-beta: oauth-2025-04-20\"")
+        .map_err(|_| RefreshError::Unavailable)?;
+    writeln!(
+        stdin,
+        "header = \"User-Agent: harness-status/{}\"",
+        env!("CARGO_PKG_VERSION")
+    )
+    .map_err(|_| RefreshError::Unavailable)?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .map_err(|_| RefreshError::Unavailable)?;
+    if !output.status.success() {
+        return Err(RefreshError::Unavailable);
+    }
+    let output = String::from_utf8(output.stdout).map_err(|_| RefreshError::Unavailable)?;
+    let (body, metadata) = output
+        .rsplit_once("\n__HARNESS_STATUS_HTTP__")
+        .ok_or(RefreshError::Unavailable)?;
+    let (status, retry_after) = metadata.split_once('|').unwrap_or((metadata, ""));
+    if status == "429" {
+        return Err(RefreshError::RateLimited(parse_retry_after(
+            retry_after,
+            now,
+        )));
+    }
+    if status != "200" {
+        return Err(RefreshError::Unavailable);
+    }
+    let response: Value = serde_json::from_str(body).map_err(|_| RefreshError::Unavailable)?;
+    let five_hour = parse_claude_api_window(response.get("five_hour"));
+    let seven_day = parse_claude_api_window(response.get("seven_day"));
+    if five_hour.is_none() && seven_day.is_none() {
+        return Err(RefreshError::Unavailable);
+    }
+    Ok(StoredUsage {
+        updated_at: now,
+        five_hour,
+        seven_day,
+    })
+}
+
+fn claude_config_dir() -> io::Result<PathBuf> {
+    if let Some(path) = env::var_os("CLAUDE_CONFIG_DIR").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(path).join(".claude"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
+}
+
+fn parse_claude_api_window(value: Option<&Value>) -> Option<UsageWindow> {
+    let value = value?;
+    let resets_at = value.get("resets_at")?.as_str()?;
+    let resets_at = resets_at.parse::<jiff::Timestamp>().ok()?.as_second() as u64;
+    usage_window(value.get("utilization")?.as_f64()?, resets_at)
+}
+
+fn parse_retry_after(value: &str, now: u64) -> Option<u64> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(seconds);
+    }
+    let timestamp = value.trim().parse::<jiff::Timestamp>().ok()?.as_second() as u64;
+    Some(timestamp.saturating_sub(now))
+}
+
+fn usage_window(percentage: f64, resets_at: u64) -> Option<UsageWindow> {
+    if !(0.0..=100.0).contains(&percentage) || resets_at == 0 {
+        return None;
+    }
+    let used_percentage = percentage.round() as u8;
+    Some(UsageWindow {
+        used_percentage,
+        remaining_percentage: 100 - used_percentage,
+        resets_at,
+    })
 }
 
 fn read_codex_usage() -> io::Result<Option<StoredUsage>> {
@@ -2221,6 +2557,49 @@ fn missing_listener(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_refresh_backoff_respects_provider_limits() {
+        let now = 1_000;
+        let mut refresh = ProviderRefresh::default();
+
+        refresh_failed(&mut refresh, now, RefreshError::RateLimited(None));
+        assert_eq!(refresh.next_at, now + 180);
+        assert_eq!(refresh.failures, 1);
+
+        refresh_failed(&mut refresh, now, RefreshError::RateLimited(None));
+        assert_eq!(refresh.next_at, now + 360);
+
+        refresh_failed(&mut refresh, now, RefreshError::RateLimited(Some(600)));
+        assert_eq!(refresh.next_at, now + 720);
+
+        refresh_failed(&mut refresh, now, RefreshError::RateLimited(None));
+        assert_eq!(refresh.next_at, now + 900);
+
+        refresh_failed(&mut refresh, now, RefreshError::Unavailable);
+        assert_eq!(refresh.next_at, now + 180);
+
+        refresh_succeeded(&mut refresh, now);
+        assert_eq!(refresh.next_at, now + 180);
+        assert_eq!(refresh.failures, 0);
+    }
+
+    #[test]
+    fn claude_usage_timestamps_and_retry_after_are_normalized() {
+        let window = parse_claude_api_window(Some(&json!({
+            "utilization": 56.4,
+            "resets_at": "2033-05-18T03:33:19Z"
+        })))
+        .unwrap();
+        assert_eq!(window.used_percentage, 56);
+        assert_eq!(window.remaining_percentage, 44);
+        assert_eq!(window.resets_at, 1_999_999_999);
+        assert_eq!(parse_retry_after("240", 1_000), Some(240));
+        assert_eq!(
+            parse_retry_after("2033-05-18T03:33:19Z", 1_999_999_000),
+            Some(999)
+        );
+    }
 
     fn event(name: &str, notification_type: Option<&str>) -> HookEvent {
         event_with_delegation(name, notification_type, false)

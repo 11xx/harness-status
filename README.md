@@ -331,7 +331,7 @@ Place the exported widget wherever indicators should appear:
 (harness-status-codex)
 (harness-status-claude)
 (harness-status-pi)
-(harness-usage)
+(harness-usage :assets "./modules/harness-status/assets")
 ```
 
 The module defines no window or bar and assumes no window manager, monitor,
@@ -357,10 +357,13 @@ it wants the user, the model, and the turn's `duration` as the stream already
 formatted it, so the module needs no timer or clock variable of its own.
 Clicking any state acknowledges the indicator.
 
-The separate `harness-usage` widget shows five-hour and seven-day percentages
-as `C 22/35%` and `✻ 48/61%`. A leading `~` and reduced opacity mark retained
-stale values; question marks mark unavailable windows. Its tooltip states the
-provider freshness and observation age. The module owns one 30-minute
+The separate `harness-usage` widget shows each provider's SVG mark followed by
+its five-hour and seven-day percentages. A leading `~` and reduced opacity mark retained
+stale values; question marks mark unavailable windows. Percentages count the
+remaining allowance down from 100 to 0, and the tooltip labels them as left.
+The provider icons are SVGL's [Codex](https://svgl.app/library/codex_dark.svg)
+and [Claude](https://svgl.app/library/claude-ai-icon.svg) assets. Its tooltip also
+states provider freshness and observation age. The module owns one 30-minute
 `defpoll`, so multiple widget instances consume the same JSON value without
 starting one process per provider or bar.
 

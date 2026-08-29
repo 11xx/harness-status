@@ -55,6 +55,7 @@ enum Action {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct UsageWindow {
     used_percentage: u8,
+    remaining_percentage: u8,
     resets_at: u64,
 }
 
@@ -898,6 +899,7 @@ fn parse_usage_window(value: Option<&Value>) -> Option<UsageWindow> {
     }
     Some(UsageWindow {
         used_percentage: percentage.round() as u8,
+        remaining_percentage: 100 - percentage.round() as u8,
         resets_at,
     })
 }
@@ -1019,6 +1021,7 @@ fn parse_codex_window(value: Option<&Value>) -> Option<UsageWindow> {
     }
     Some(UsageWindow {
         used_percentage: percentage.round() as u8,
+        remaining_percentage: 100 - percentage.round() as u8,
         resets_at,
     })
 }

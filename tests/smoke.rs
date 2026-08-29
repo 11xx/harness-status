@@ -52,6 +52,10 @@ fn usage_report_normalizes_local_codex_and_claude_windows() {
     assert!(unavailable.status.success());
     let unavailable: Value = serde_json::from_slice(&unavailable.stdout).unwrap();
     assert_eq!(unavailable["codex"]["five_hour"]["used_percentage"], 22);
+    assert_eq!(
+        unavailable["codex"]["five_hour"]["remaining_percentage"],
+        78
+    );
     assert_eq!(unavailable["claude"]["state"], "unavailable");
     assert_eq!(unavailable["state"], "stale");
 
@@ -85,6 +89,7 @@ fn usage_report_normalizes_local_codex_and_claude_windows() {
     let report: Value = serde_json::from_slice(&report.stdout).unwrap();
     assert_eq!(report["state"], "fresh");
     assert_eq!(report["claude"]["five_hour"]["used_percentage"], 48);
+    assert_eq!(report["claude"]["five_hour"]["remaining_percentage"], 52);
     assert_eq!(report["claude"]["seven_day"]["used_percentage"], 61);
     assert_eq!(
         fs::metadata(dir.join("harness-status-usage.json"))

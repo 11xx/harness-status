@@ -270,6 +270,122 @@ printf '\n__HARNESS_STATUS_HTTP__200|'
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn claude_usage_and_ping_toggles_are_independent_and_reversible() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("helpers/ai-window-ping");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-toggle-test-{nonce}"));
+    let state_home = dir.join("state");
+    let socket = dir.join("status.sock");
+    let bin_dir = dir.join("bin");
+    let home = dir.join("home");
+    let claude_log = dir.join("claude-calls");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        bin_dir.join("claude"),
+        "#!/bin/sh\nprintf '%s\\n' invoked >>\"$FAKE_CLAUDE_LOG\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin_dir.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run = |args: &[&str]| {
+        Command::new(binary)
+            .args(args)
+            .env("XDG_STATE_HOME", &state_home)
+            .env("HARNESS_STATUS_SOCKET", &socket)
+            .env("HARNESS_STATUS_USAGE_REFRESH", "0")
+            .output()
+            .unwrap()
+    };
+    let ingest = |payload: Value| {
+        let mut child = Command::new(binary)
+            .args(["usage", "ingest", "claude"])
+            .env("XDG_STATE_HOME", &state_home)
+            .env("HARNESS_STATUS_SOCKET", &socket)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    };
+
+    ingest(json!({
+        "rate_limits": {
+            "five_hour": {"used_percentage": 20, "resets_at": 1_999_999_999_u64}
+        }
+    }));
+    let disabled = run(["usage", "disable"].as_slice());
+    assert!(disabled.status.success());
+    assert!(
+        state_home
+            .join("harness-status/claude-usage.disabled")
+            .is_file()
+    );
+
+    ingest(json!({
+        "rate_limits": {
+            "five_hour": {"used_percentage": 90, "resets_at": 1_999_999_999_u64}
+        }
+    }));
+    let report: Value = serde_json::from_slice(&run(["usage"].as_slice()).stdout).unwrap();
+    assert_eq!(report["claude"]["state"], "disabled");
+    assert!(report["claude"]["five_hour"].is_null());
+    let cache: Value =
+        serde_json::from_slice(&fs::read(dir.join("harness-status-usage.json")).unwrap()).unwrap();
+    assert_eq!(cache["claude"]["five_hour"]["used_percentage"], 20);
+
+    assert!(run(["usage", "enable"].as_slice()).status.success());
+    let report: Value = serde_json::from_slice(&run(["usage"].as_slice()).stdout).unwrap();
+    assert_eq!(report["claude"]["five_hour"]["used_percentage"], 20);
+
+    let ping_disabled = run(["ping", "disable"].as_slice());
+    assert!(ping_disabled.status.success());
+    assert!(
+        state_home
+            .join("harness-status/claude-window-ping.disabled")
+            .is_file()
+    );
+    let disabled_ping = Command::new(&helper)
+        .arg("claude")
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+        .env("FAKE_CLAUDE_LOG", &claude_log)
+        .output()
+        .unwrap();
+    assert!(disabled_ping.status.success());
+    assert!(!claude_log.exists());
+
+    assert!(run(["ping", "enable"].as_slice()).status.success());
+    let enabled_ping = Command::new(&helper)
+        .arg("claude")
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+        .env("FAKE_CLAUDE_LOG", &claude_log)
+        .output()
+        .unwrap();
+    assert!(enabled_ping.status.success());
+    assert_eq!(fs::read_to_string(&claude_log).unwrap().lines().count(), 1);
+    assert!(
+        state_home
+            .join("ai-window-ping/claude.last-success")
+            .is_file()
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
 impl Drop for Follower {
     fn drop(&mut self) {
         let _ = self.child.kill();

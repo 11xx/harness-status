@@ -947,8 +947,7 @@ fn print_usage_report() -> io::Result<()> {
     let claude_enabled = claude_usage_enabled()?;
     let path = usage_state_path()?;
     let mut cache = read_usage_cache(&path)?;
-    if claude_enabled
-        && active_refresh_enabled()
+    if active_refresh_enabled()
         && let Some(_lock) = try_usage_lock()?
     {
         cache = read_usage_cache(&path)?;
@@ -963,7 +962,7 @@ fn print_usage_report() -> io::Result<()> {
                 Err(error) => refresh_failed(&mut cache.refresh.codex, now, error),
             }
         }
-        if cache.refresh.claude.next_at <= now {
+        if claude_enabled && cache.refresh.claude.next_at <= now {
             changed = true;
             match refresh_claude_usage(now) {
                 Ok(usage) => {

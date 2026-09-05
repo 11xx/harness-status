@@ -386,6 +386,51 @@ fn claude_usage_and_ping_toggles_are_independent_and_reversible() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn disabling_claude_usage_does_not_disable_codex_refresh() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-independent-refresh-test-{nonce}"));
+    let bin_dir = dir.join("bin");
+    let state_home = dir.join("state");
+    let home = dir.join("home");
+    let codex_log = dir.join("codex-calls");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(state_home.join("harness-status")).unwrap();
+    fs::write(
+        state_home.join("harness-status/claude-usage.disabled"),
+        "disabled\n",
+    )
+    .unwrap();
+    fs::write(
+        bin_dir.join("codex"),
+        "#!/bin/sh\nprintf '%s\\n' called >>\"$FAKE_CODEX_LOG\"\nprintf '%s\\n' '{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":12,\"resetsAt\":1999999999},\"secondary\":{\"usedPercent\":34,\"resetsAt\":1999999999}}}}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin_dir.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(binary)
+        .arg("usage")
+        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("HARNESS_STATUS_SOCKET", dir.join("status.sock"))
+        .env("FAKE_CODEX_LOG", &codex_log)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["codex"]["state"], "fresh");
+    assert_eq!(report["claude"]["state"], "disabled");
+    assert_eq!(fs::read_to_string(codex_log).unwrap().lines().count(), 1);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
 impl Drop for Follower {
     fn drop(&mut self) {
         let _ = self.child.kill();

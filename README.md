@@ -48,12 +48,16 @@ bar reloads cannot accumulate abandoned Unix sockets.
 Rust 1.97 or newer is recommended.
 
 ```sh
-cargo build --release
-cargo install --path . --root "$HOME/.local" --force
+make install
 harness-status install codex
 harness-status install claude
 harness-status install pi
 ```
+
+`make install` builds the release binary and installs both `harness-status` and
+its Claude window-ping helper. Use `BINDIR` and `AI_BINDIR` to override the
+installation directories. A direct binary-only installation remains available
+with `cargo install --path . --root "$HOME/.local" --force`.
 
 ## Usage
 
@@ -85,6 +89,8 @@ harness-status install pi
 harness-status uninstall pi
 harness-status usage
 harness-status usage ingest claude
+harness-status usage enable|disable|toggle
+harness-status ping enable|disable|toggle
 ```
 
 `harness-status usage` prints one normalized account-window report for Codex
@@ -94,6 +100,17 @@ every three minutes. Claude's endpoint is not a public API; the command reads
 the existing unexpired Claude access token, sends it to Anthropic through
 `curl` standard input, and never refreshes, rewrites, logs, or places it in a
 process argument. Neither provider refresh starts a model request.
+
+Claude usage tracking is independently controlled with `harness-status usage disable`,
+`enable`, or `toggle`. The disabled state is the marker
+`$XDG_STATE_HOME/harness-status/claude-usage.disabled` (falling back to
+`~/.local/state`); it stops Claude refresh, passive ingestion, and the Claude
+usage widget while retaining the cache. Codex usage remains available.
+
+The five-hour Claude window ping has its own control:
+`harness-status ping disable`, `enable`, or `toggle`. The helper reads
+`$XDG_STATE_HOME/harness-status/claude-window-ping.disabled` and exits without
+calling Claude when that marker exists.
 
 Normal client activity remains the fastest update path. Codex session events
 seed the report when the app server is unavailable, while Claude's status line
@@ -372,8 +389,10 @@ formatted it, so the module needs no timer or clock variable of its own.
 Clicking any state acknowledges the indicator.
 
 The separate `harness-usage` widget shows each provider's SVG mark followed by
-its five-hour and seven-day percentages. A leading `~` and reduced opacity mark retained
-stale values; question marks mark unavailable windows. Percentages count the
+its five-hour and seven-day percentages. A disabled Claude usage provider is
+hidden; its cached values are not displayed or refreshed until usage tracking
+is enabled. A leading `~` and reduced opacity mark retained stale values;
+question marks mark unavailable windows. Percentages count the
 remaining allowance down from 100 to 0, and the tooltip labels them as left.
 The provider icons are SVGL's [Codex](https://svgl.app/library/codex_dark.svg)
 and [Claude](https://svgl.app/library/claude-ai-icon.svg) assets, recolored to
@@ -388,6 +407,20 @@ consume the same JSON value without starting one request per provider or bar.
 All adapters share the same semantic working/completed/attention classes, so pi
 stays consistent with the other Eww indicators. Glyph choices live entirely in
 the Eww module; the JSON contract exposes state data rather than presentation.
+
+## Helper installation
+
+The repository owns the five-hour Claude helper. Build and install the binary
+and helper with:
+
+```sh
+make install
+```
+
+`BINDIR` and `AI_BINDIR` can override the default destinations, which are
+`$XDG_BIN_HOME` or `~/.local/bin` and its `ai` subdirectory. The systemd
+service invokes `ai-window-ping claude` through `sh -c`, so the user manager's
+`PATH` from `environment.d` is used rather than an absolute helper path.
 
 ## Verification
 

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -u
+
+prompt="hi"
+claude_model="haiku"
+claude_effort="low"
+timeout_duration="${AI_WINDOW_PING_TIMEOUT:-180s}"
+state_root="${XDG_STATE_HOME:-${HOME}/.local/state}"
+state_dir="${state_root}/ai-window-ping"
+disabled_marker="${state_root}/harness-status/claude-window-ping.disabled"
+
+log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"
+}
+
+run_claude() {
+    timeout "$timeout_duration" \
+        claude -p \
+        --model "$claude_model" \
+        --effort "$claude_effort" \
+        --disable-slash-commands \
+        --no-session-persistence \
+        "$prompt"
+}
+
+if (( $# > 0 )) && [[ "$1" != claude || $# -gt 1 ]]; then
+    log "ERROR: only the Claude instance is supported"
+    exit 64
+fi
+
+if [[ -e "$disabled_marker" ]]; then
+    log "Claude ping disabled."
+    exit 0
+fi
+
+mkdir -p "$state_dir"
+output_log="$(mktemp "${TMPDIR:-/tmp}/ai-window-ping.claude.XXXXXX")"
+trap 'rm -f "$output_log"' EXIT
+log "Pinging Claude..."
+if run_claude >"$output_log" 2>&1; then
+    date '+%Y-%m-%dT%H:%M:%S%z' > "${state_dir}/claude.last-success"
+    log "Claude ping succeeded."
+else
+    rc=$?
+    log "ERROR: Claude ping failed with exit status ${rc}."
+    sed -n '1,80p' "$output_log" >&2
+    exit "$rc"
+fi
+
+exit 0

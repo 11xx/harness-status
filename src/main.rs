@@ -41,6 +41,16 @@ const USAGE_REFRESH_SECONDS: u64 = 3 * 60;
 const USAGE_BACKOFF_MAX_SECONDS: u64 = 15 * 60;
 const USAGE_STATE_FILE: &str = "harness-status-usage.json";
 const USAGE_LOCK_FILE: &str = "harness-status-usage.lock";
+const FEATURE_STATE_DIR: &str = "harness-status";
+const CLAUDE_USAGE_DISABLED_MARKER: &str = "claude-usage.disabled";
+const CLAUDE_WINDOW_PING_DISABLED_MARKER: &str = "claude-window-ping.disabled";
+
+#[derive(Clone, Copy, Debug)]
+enum FeatureControl {
+    Enable,
+    Disable,
+    Toggle,
+}
 
 #[derive(Debug)]
 enum Action {
@@ -51,7 +61,9 @@ enum Action {
     Install { harness: String },
     Uninstall { harness: String },
     Usage,
+    UsageControl { control: FeatureControl },
     UsageIngest { harness: String },
+    PingControl { control: FeatureControl },
     Help,
     Version,
 }
@@ -252,7 +264,7 @@ struct TranscriptPayload {
 enum Request {
     Hook {
         harness: String,
-        event: HookEvent,
+        event: Box<HookEvent>,
         owner: Option<Owner>,
     },
     Snapshot {
@@ -716,7 +728,17 @@ fn main() {
         Action::Install { harness } => install_integration(&harness),
         Action::Uninstall { harness } => uninstall_integration(&harness),
         Action::Usage => print_usage_report(),
+        Action::UsageControl { control } => control_feature(
+            "Claude usage tracking",
+            CLAUDE_USAGE_DISABLED_MARKER,
+            control,
+        ),
         Action::UsageIngest { harness } => ingest_usage(&harness),
+        Action::PingControl { control } => control_feature(
+            "Claude window ping",
+            CLAUDE_WINDOW_PING_DISABLED_MARKER,
+            control,
+        ),
         Action::Help => {
             print_help();
             Ok(())
@@ -774,8 +796,36 @@ fn parse_args() -> Result<Action, String> {
                     .ok_or_else(|| "'usage ingest' requires a harness name".to_owned())?;
                 no_more_args(args, Action::UsageIngest { harness })
             }
+            Some("enable") => no_more_args(
+                args,
+                Action::UsageControl {
+                    control: FeatureControl::Enable,
+                },
+            ),
+            Some("disable") => no_more_args(
+                args,
+                Action::UsageControl {
+                    control: FeatureControl::Disable,
+                },
+            ),
+            Some("toggle") => no_more_args(
+                args,
+                Action::UsageControl {
+                    control: FeatureControl::Toggle,
+                },
+            ),
             Some(other) => Err(format!("unexpected argument '{other}'")),
         },
+        "ping" => {
+            let control = match args.next().as_deref() {
+                Some("enable") => FeatureControl::Enable,
+                Some("disable") => FeatureControl::Disable,
+                Some("toggle") => FeatureControl::Toggle,
+                Some(other) => return Err(format!("unexpected argument '{other}'")),
+                None => return Err("'ping' requires enable, disable, or toggle".to_owned()),
+            };
+            no_more_args(args, Action::PingControl { control })
+        }
         "-f" | "--follow" => {
             let harness = args.next();
             no_more_args(args, Action::Follow { harness })
@@ -813,6 +863,8 @@ Usage:
   harness-status uninstall HARNESS
   harness-status usage
   harness-status usage ingest claude
+  harness-status usage enable|disable|toggle
+  harness-status ping enable|disable|toggle
 
 Print an in-memory AI harness status snapshot as JSON, or stream changed
 snapshots as JSONL. With no HARNESS, snapshot and follow modes include all
@@ -825,6 +877,10 @@ Commands:
   uninstall HARNESS   Remove the harness integration from its user config
   usage               Print normalized Codex and Claude account windows
   usage ingest claude Store sanitized windows from a Claude status payload
+  usage enable|disable|toggle
+                      Control Claude usage refresh, ingestion, and display
+  ping enable|disable|toggle
+                      Control the five-hour Claude window ping helper
 
 Options:
   -f, --follow       Own or subscribe to the registry and print changed JSON
@@ -888,9 +944,11 @@ fn unsupported_harness(harness: &str) -> io::Error {
 
 fn print_usage_report() -> io::Result<()> {
     let now = unix_time_seconds();
+    let claude_enabled = claude_usage_enabled()?;
     let path = usage_state_path()?;
     let mut cache = read_usage_cache(&path)?;
-    if active_refresh_enabled()
+    if claude_enabled
+        && active_refresh_enabled()
         && let Some(_lock) = try_usage_lock()?
     {
         cache = read_usage_cache(&path)?;
@@ -921,12 +979,12 @@ fn print_usage_report() -> io::Result<()> {
         }
     }
     let codex = provider_usage(cache.codex.or(read_codex_usage()?), now);
-    let claude = provider_usage(cache.claude, now);
-    let state = match (codex.state, claude.state) {
-        ("fresh", "fresh") => "fresh",
-        ("unavailable", "unavailable") => "unavailable",
-        _ => "stale",
+    let claude = if claude_enabled {
+        provider_usage(cache.claude, now)
+    } else {
+        disabled_provider_usage()
     };
+    let state = usage_report_state(codex.state, claude.state);
     let report = UsageReport {
         updated_at: now,
         state,
@@ -947,6 +1005,9 @@ fn active_refresh_enabled() -> bool {
 fn ingest_usage(harness: &str) -> io::Result<()> {
     if harness != "claude" {
         return Err(unsupported_harness(harness));
+    }
+    if !claude_usage_enabled()? {
+        return Ok(());
     }
     let input: Value = match serde_json::from_reader(io::stdin().lock()) {
         Ok(input) => input,
@@ -1022,6 +1083,34 @@ fn parse_usage_window(value: Option<&Value>) -> Option<UsageWindow> {
     })
 }
 
+fn disabled_provider_usage() -> ProviderUsage {
+    ProviderUsage {
+        state: "disabled",
+        updated_at: None,
+        age_minutes: None,
+        five_hour: None,
+        seven_day: None,
+    }
+}
+
+fn usage_report_state(codex: &str, claude: &str) -> &'static str {
+    match (codex, claude) {
+        (codex, "disabled") => match codex {
+            "fresh" => "fresh",
+            "unavailable" => "unavailable",
+            _ => "stale",
+        },
+        ("disabled", claude) => match claude {
+            "fresh" => "fresh",
+            "unavailable" => "unavailable",
+            _ => "stale",
+        },
+        ("fresh", "fresh") => "fresh",
+        ("unavailable", "unavailable") => "unavailable",
+        _ => "stale",
+    }
+}
+
 fn provider_usage(stored: Option<StoredUsage>, now: u64) -> ProviderUsage {
     let Some(stored) = stored else {
         return ProviderUsage {
@@ -1082,6 +1171,53 @@ fn usage_state_path() -> io::Result<PathBuf> {
         .parent()
         .unwrap_or_else(|| Path::new("/tmp"))
         .join(USAGE_STATE_FILE))
+}
+
+fn feature_marker_path(file_name: &str) -> io::Result<PathBuf> {
+    Ok(xdg_state_home()?.join(FEATURE_STATE_DIR).join(file_name))
+}
+
+fn xdg_state_home() -> io::Result<PathBuf> {
+    if let Some(path) = env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(path).join(".local/state"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
+}
+
+fn feature_disabled(file_name: &str) -> io::Result<bool> {
+    match fs::symlink_metadata(feature_marker_path(file_name)?) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn claude_usage_enabled() -> io::Result<bool> {
+    Ok(!feature_disabled(CLAUDE_USAGE_DISABLED_MARKER)?)
+}
+
+fn control_feature(label: &str, marker_name: &str, control: FeatureControl) -> io::Result<()> {
+    let marker = feature_marker_path(marker_name)?;
+    let disabled = match control {
+        FeatureControl::Enable => false,
+        FeatureControl::Disable => true,
+        FeatureControl::Toggle => !feature_disabled(marker_name)?,
+    };
+    if disabled {
+        write_bytes_atomic(&marker, b"disabled\n", ".harness-status-feature")?;
+        println!("{label} disabled.");
+    } else {
+        match fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        println!("{label} enabled.");
+    }
+    Ok(())
 }
 
 fn usage_lock_path() -> io::Result<PathBuf> {
@@ -2038,7 +2174,7 @@ fn follow_as_owner(
                             event,
                             owner,
                         } => {
-                            let result = registry.apply_hook(&source, event, owner);
+                            let result = registry.apply_hook(&source, *event, owner);
                             changed = result.changed;
                             notification = result.notification;
                         }
@@ -2355,7 +2491,7 @@ fn send_hook(harness: &str) {
 
     let request = Request::Hook {
         harness: harness.to_owned(),
-        event,
+        event: Box::new(event),
         owner,
     };
     send_fire_and_forget(&request);

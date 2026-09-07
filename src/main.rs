@@ -200,7 +200,7 @@ struct TranscriptCursor {
     offset: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Clone, Deserialize)]
 struct TranscriptRecord {
     #[serde(rename = "type")]
     kind: String,
@@ -214,7 +214,7 @@ struct TranscriptRecord {
     message: TranscriptMessage,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Clone, Deserialize)]
 struct TranscriptMessage {
     #[serde(default)]
     model: Option<String>,
@@ -222,7 +222,11 @@ struct TranscriptMessage {
 
 #[derive(Default)]
 struct TurnReport {
+    /// The turn was abandoned outright, so its entry leaves the registry.
     aborted: bool,
+    /// The harness ended the turn with an error of its own, so the entry
+    /// settles as attention instead of running on.
+    failed: bool,
     model: Option<String>,
 }
 
@@ -249,14 +253,35 @@ impl TranscriptRecord {
             _ => false,
         }
     }
+
+    /// A turn the harness itself could not finish ends without a Stop hook.
+    /// Codex closes it with a completed event carrying its usage-limit error,
+    /// matched narrowly because unknown error codes may yet be recoverable.
+    fn reports_limit_failure(&self, harness: &str, turn_id: &str) -> bool {
+        harness == "codex"
+            && self.kind == "event_msg"
+            && self.payload.kind == "task_complete"
+            && self.payload.turn_id.as_deref() == Some(turn_id)
+            && self
+                .payload
+                .error
+                .as_ref()
+                .and_then(|error| error.get("codex_error_info"))
+                .and_then(Value::as_str)
+                == Some("usage_limit_exceeded")
+    }
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Clone, Deserialize)]
 struct TranscriptPayload {
     #[serde(rename = "type", default)]
     kind: String,
     #[serde(default)]
     turn_id: Option<String>,
+    /// A turn the harness closed with an error of its own carries the error
+    /// beside its completion, not on the record itself.
+    #[serde(default)]
+    error: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -326,8 +351,10 @@ fn format_duration(seconds: u64) -> String {
         format!("{seconds}s")
     } else if seconds < 3600 {
         format!("{}m", seconds / 60)
-    } else {
+    } else if seconds < 86_400 {
         format!("{}h{:02}m", seconds / 3600, seconds % 3600 / 60)
+    } else {
+        format!("{}d{:02}h", seconds / 86_400, seconds % 86_400 / 3600)
     }
 }
 
@@ -644,12 +671,31 @@ impl Registry {
         before != self.entries.len()
     }
 
-    /// Tails each running turn's transcript for the two facts a lifecycle hook
-    /// never delivers: that the user interrupted the turn, and which model
-    /// answered it.
-    fn follow_running_transcripts(&mut self) -> bool {
+    /// A checkpoint saved by a binary that did not yet recognize a codex
+    /// failure has tailed its cursors past the closing record. Rewinding the
+    /// codex cursors of running turns lets the first tail pass after an
+    /// upgrade read the whole turn; both codex end-of-turn predicates match on
+    /// the turn's own id, so earlier turns cannot misfire.
+    fn rewind_codex_transcripts(&mut self) {
+        for entry in &mut self.entries {
+            if entry.status.harness == "codex"
+                && entry.status.state == "working"
+                && let Some(transcript) = entry.transcript.as_mut()
+            {
+                transcript.offset = 0;
+            }
+        }
+    }
+
+    /// Tails each running turn's transcript for the facts a lifecycle hook
+    /// never delivers: that the user interrupted the turn, that the harness
+    /// ended the turn with an error of its own, and which model answered it.
+    /// An interrupt retires the entry; a harness-reported failure settles it as
+    /// attention, and the notification that transition deserves.
+    fn follow_running_transcripts(&mut self) -> (bool, Option<Notification>) {
         let before = self.entries.len();
         let mut changed = false;
+        let mut failure = None;
         self.entries.retain_mut(|entry| {
             if entry.status.state != "working" {
                 return true;
@@ -668,9 +714,24 @@ impl Registry {
                 entry.status.model = Some(model);
                 changed = true;
             }
-            !report.aborted
+            if report.aborted {
+                return false;
+            }
+            if report.failed {
+                entry.status.state = "attention".to_owned();
+                entry.status.reason = Some("failure".to_owned());
+                entry.status.updated_at = unix_time_seconds();
+                changed = true;
+                failure = Some(Notification {
+                    harness: entry.status.harness.clone(),
+                    project: entry.status.name.clone(),
+                    state: "attention".to_owned(),
+                    reason: Some("failure".to_owned()),
+                });
+            }
+            true
         });
-        changed || before != self.entries.len()
+        (changed || before != self.entries.len(), failure)
     }
 
     fn snapshot_json(&self, harness: Option<&str>) -> String {
@@ -2153,6 +2214,7 @@ fn follow_as_owner(
     let state_path = registry_state_path(path);
     let notifier = Notifier::from_env();
     let mut registry = load_registry(&state_path);
+    registry.rewind_codex_transcripts();
     registry.follow_running_transcripts();
     registry.reap_dead_owners();
     checkpoint_registry(&state_path, &registry);
@@ -2206,7 +2268,11 @@ fn follow_as_owner(
             Err(error) => return Err(error),
         }
 
-        changed |= registry.follow_running_transcripts();
+        let (transcripts_changed, transcript_failure) = registry.follow_running_transcripts();
+        changed |= transcripts_changed;
+        if notification.is_none() {
+            notification = transcript_failure;
+        }
         changed |= registry.settle_quiet_entries();
         changed |= registry.reap_dead_owners();
         if changed {
@@ -2525,6 +2591,10 @@ fn read_transcript_turn(
         }
         if record.reports_abort(harness, turn_id) {
             report.aborted = true;
+            return Ok(report);
+        }
+        if record.reports_limit_failure(harness, turn_id) {
+            report.failed = true;
             return Ok(report);
         }
     }
@@ -3019,6 +3089,9 @@ mod tests {
         assert_eq!(format_duration(3599), "59m");
         assert_eq!(format_duration(3600), "1h00m");
         assert_eq!(format_duration(7500), "2h05m");
+        assert_eq!(format_duration(86_399), "23h59m");
+        assert_eq!(format_duration(86_400), "1d00h");
+        assert_eq!(format_duration(178_812), "2d01h");
     }
 
     #[test]
@@ -3128,6 +3201,159 @@ mod tests {
         let resumed_completed = registry.apply_hook("pi", event("ResumeCompleted", None), None);
         assert!(resumed_completed.notification.is_none());
         assert_eq!(registry.entries[0].status.state, "completed");
+    }
+
+    #[test]
+    fn codex_closing_a_turn_with_its_usage_limit_error_is_a_failure_not_silence() {
+        let mut registry = Registry::default();
+        let mut start = event("UserPromptSubmit", None);
+        start.turn_id = Some("turn-limit".to_owned());
+        start.transcript = Some(TranscriptCursor {
+            path: env::temp_dir().join("harness-status-absent-transcript.jsonl"),
+            offset: 0,
+        });
+        registry.apply_hook("codex", start, None);
+        registry.entries[0].status.started_at = Some(1_000);
+        registry.entries[0].status.updated_at = 1_000;
+
+        let limit_record = TranscriptRecord {
+            kind: "event_msg".to_owned(),
+            payload: TranscriptPayload {
+                kind: "task_complete".to_owned(),
+                turn_id: Some("turn-limit".to_owned()),
+                error: Some(json!({"codex_error_info": "usage_limit_exceeded"})),
+            },
+            prompt_id: None,
+            interrupted_message_id: None,
+            message: TranscriptMessage::default(),
+        };
+        assert!(limit_record.reports_limit_failure("codex", "turn-limit"));
+        // The same completion without a turn match, without an error, or with
+        // an unrecognized error code leaves the turn alone.
+        assert!(!limit_record.reports_limit_failure("codex", "other-turn"));
+        let clean = TranscriptRecord {
+            payload: TranscriptPayload {
+                error: None,
+                ..limit_record.payload.clone()
+            },
+            ..limit_record.clone()
+        };
+        assert!(!clean.reports_limit_failure("codex", "turn-limit"));
+        let other_code = TranscriptRecord {
+            payload: TranscriptPayload {
+                error: Some(json!({"codex_error_info": "context_window_exceeded"})),
+                ..limit_record.payload.clone()
+            },
+            ..limit_record.clone()
+        };
+        assert!(!other_code.reports_limit_failure("codex", "turn-limit"));
+        // Claude has no such vocabulary; its own StopFailure hook covers it.
+        assert!(!limit_record.reports_limit_failure("claude", "turn-limit"));
+
+        // The tail settles the thread as attention, not as a missing entry.
+        // The record reaches the tail through a real transcript file.
+        let transcript = env::temp_dir().join(format!(
+            "harness-status-limit-test-{}-{}.jsonl",
+            process::id(),
+            unix_time_seconds()
+        ));
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                json!({"type": "session_meta"}),
+                json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "turn-limit",
+                        "error": {"codex_error_info": "usage_limit_exceeded"}
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        registry.entries[0].transcript = Some(TranscriptCursor {
+            path: transcript.clone(),
+            offset: 0,
+        });
+        let (changed, notification) = registry.follow_running_transcripts();
+        assert!(changed);
+        assert_eq!(registry.entries.len(), 1);
+        assert_eq!(registry.entries[0].status.state, "attention");
+        assert_eq!(
+            registry.entries[0].status.reason.as_deref(),
+            Some("failure")
+        );
+        let notification = notification.expect("a failure notifies");
+        assert_eq!(notification.state, "attention");
+        assert_eq!(notification.reason.as_deref(), Some("failure"));
+        fs::remove_file(&transcript).unwrap();
+        // A settled entry is never tailed again, so the notification cannot
+        // repeat; and the aborted path still retires without notifying.
+        let (changed, notification) = registry.follow_running_transcripts();
+        assert!(!changed);
+        assert!(notification.is_none());
+    }
+
+    #[test]
+    fn a_turn_aborted_during_the_tail_still_retires_without_notifying() {
+        // The abort path is exercised end to end by the smoke suite; here the
+        // empty-report default proves an absent transcript retires nothing.
+        let mut registry = Registry::default();
+        let mut start = event("UserPromptSubmit", None);
+        start.turn_id = Some("turn-x".to_owned());
+        start.transcript = Some(TranscriptCursor {
+            path: PathBuf::from("/harness-status-nonexistent/transcript.jsonl"),
+            offset: 0,
+        });
+        registry.apply_hook("codex", start, None);
+        let (changed, notification) = registry.follow_running_transcripts();
+        assert!(!changed);
+        assert!(notification.is_none());
+        assert_eq!(registry.entries[0].status.state, "working");
+    }
+
+    #[test]
+    fn restoring_a_checkpoint_rewinds_codex_running_transcripts() {
+        let mut registry = Registry::default();
+        let mut start = event("UserPromptSubmit", None);
+        start.transcript = Some(TranscriptCursor {
+            path: PathBuf::from("/tmp/codex-rollout.jsonl"),
+            offset: 9_999,
+        });
+        registry.apply_hook("codex", start, None);
+
+        let mut claude_start = event("UserPromptSubmit", None);
+        claude_start.transcript = Some(TranscriptCursor {
+            path: PathBuf::from("/tmp/claude-transcript.jsonl"),
+            offset: 9_999,
+        });
+        registry.apply_hook("claude", claude_start, None);
+
+        // A settled thread is left where its last tail put it.
+        let mut settled_start = event("UserPromptSubmit", None);
+        settled_start.session_id = "settled".to_owned();
+        settled_start.transcript = Some(TranscriptCursor {
+            path: PathBuf::from("/tmp/settled-transcript.jsonl"),
+            offset: 9_999,
+        });
+        registry.apply_hook("claude", settled_start, None);
+        let mut settled_stop = event("Stop", None);
+        settled_stop.session_id = "settled".to_owned();
+        registry.apply_hook("claude", settled_stop, None);
+
+        registry.rewind_codex_transcripts();
+        assert_eq!(registry.entries.len(), 3);
+        assert_eq!(registry.entries[0].transcript.as_ref().unwrap().offset, 0);
+        assert_eq!(
+            registry.entries[1].transcript.as_ref().unwrap().offset,
+            9_999
+        );
+        assert_eq!(
+            registry.entries[2].transcript.as_ref().unwrap().offset,
+            9_999
+        );
     }
 
     #[test]

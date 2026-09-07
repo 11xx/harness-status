@@ -593,6 +593,78 @@ fn codex_hook_to_jsonl_smoke() {
 }
 
 #[test]
+fn codex_usage_limit_turn_settles_as_attention_without_a_stop() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("hs-codex-limit-{nonce}"));
+    fs::create_dir(&dir).unwrap();
+    let socket = dir.join("status.sock");
+    let child = Command::new(binary)
+        .args(["codex", "--follow"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _follower = Follower {
+        child,
+        dir: dir.clone(),
+    };
+    wait_for_socket(&socket);
+
+    let transcript = dir.join("transcript.jsonl");
+    fs::write(&transcript, "{\"type\":\"session_meta\"}\n").unwrap();
+    send_hook(
+        binary,
+        &socket,
+        "codex",
+        "UserPromptSubmit",
+        Some(&transcript),
+    );
+    wait_for_state(binary, &socket, "codex", "working");
+
+    // Codex closes a usage-limit turn with a completed event naming its error
+    // and fires no Stop hook; the transcript tail is what sees the turn end.
+    let mut transcript_file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    writeln!(
+        transcript_file,
+        "{}",
+        json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "turn-smoke",
+                "last_agent_message": null,
+                "error": {
+                    "message": "You've hit your usage limit. Try again later.",
+                    "codex_error_info": "usage_limit_exceeded"
+                }
+            }
+        })
+    )
+    .unwrap();
+    let attention = wait_for_state(binary, &socket, "codex", "attention");
+    assert_eq!(attention["threads"][0]["reason"], "failure");
+
+    // The thread stays visible for click-to-ack, and a fresh prompt reuses it.
+    assert_eq!(
+        wait_for_thread_count(binary, &socket, "codex", 1)["threads"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    send_hook(binary, &socket, "codex", "UserPromptSubmit", None);
+    wait_for_state(binary, &socket, "codex", "working");
+}
+
+#[test]
 fn claude_hook_to_jsonl_smoke() {
     let binary = env!("CARGO_BIN_EXE_harness-status");
     let nonce = SystemTime::now()

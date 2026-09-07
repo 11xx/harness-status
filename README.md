@@ -174,6 +174,12 @@ The `state` field is `working`, `completed`, `idle`, or `attention`:
   `attention` for `permission_prompt`, `elicitation_dialog`, and
   `agent_needs_input`, and returns to `working` for `elicitation_complete` and
   `elicitation_response`. `SessionEnd` removes the entry.
+- A turn the harness itself cannot finish also becomes `attention` with the
+  reason `failure`. Codex closes a usage-limit turn with a completed event
+  naming its error and fires no `Stop`, so the transcript tail is what sees the
+  turn end. The error code must match exactly: an unknown code has not shown
+  what it means, and a turn it belongs to keeps running until a hook says
+  otherwise.
 - A completed thread becomes `idle` once it has waited five minutes, or as soon
   as Claude Code reports its own `idle_prompt`. Waiting is not attention: an
   idle report never creates a thread and never interrupts one that is working.
@@ -203,7 +209,8 @@ arrived, so an indicator keeps its place while its neighbours come and go.
 
 `duration` is that turn's length, already formatted, so a bar renders it without
 arithmetic or a clock of its own: whole seconds below a minute, then whole
-minutes, then `2h05m`, always the unit reached rather than the nearest one. A
+minutes, then `2h05m`, then whole days as `2d01h`, always the unit reached
+rather than the nearest one. A
 running turn is measured against now and a settled one against the moment it
 settled, so a settled thread reports how long its turn ran instead of a number
 that climbs while nothing happens. Because a running turn advances with no event
@@ -238,8 +245,14 @@ Neither Codex nor Claude Code emits `Stop` for an Esc interruption, so while a
 turn runs both adapters tail only the records their own hook added to the
 transcript since the turn began. Codex recognizes its turn-abort event, and
 Claude Code an interrupted-message record carrying the same prompt identifier;
-either one retires the entry. An unknown transcript format fails safely and
-leaves the click-to-ack fallback. Claude's assistant records also name the
+either one retires the entry. Codex also ends a usage-limit turn without a
+`Stop` hook, naming `usage_limit_exceeded` in its completed event; that settles
+the entry as attention instead of retiring it, because the thread is waiting on
+the user's quota rather than gone. An unknown transcript format fails safely and
+leaves the click-to-ack fallback. A replacement owner rewinds the transcript
+cursors of running Codex turns before its first tail pass, so checkpoints saved
+by an older binary are re-read from the turn's beginning and turns the older
+binary missed the end of still settle correctly. Claude's assistant records also name the
 answering model, which is how a Claude entry reports a model at all and how it
 stays correct across an in-session model switch. Claude's prompt identifier
 serves as its turn ID. Pi reports its active model but has no separate turn ID

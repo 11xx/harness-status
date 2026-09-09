@@ -402,10 +402,12 @@ formatted it, so the module needs no timer or clock variable of its own.
 Clicking any state acknowledges the indicator.
 
 The separate `harness-usage` widget shows each provider's SVG mark followed by
-its five-hour and seven-day percentages. A disabled Claude usage provider is
+its available five-hour and seven-day percentages. Codex windows are classified
+by their reported duration, so weekly-only subscriptions show one percentage.
+A disabled Claude usage provider is
 hidden; its cached values are not displayed or refreshed until usage tracking
 is enabled. A leading `~` and reduced opacity mark retained stale values;
-question marks mark unavailable windows. Percentages count the
+a question mark means neither window is available. Percentages count the
 remaining allowance down from 100 to 0, and the tooltip labels them as left.
 The provider icons are SVGL's [Codex](https://svgl.app/library/codex_dark.svg)
 and [Claude](https://svgl.app/library/claude-ai-icon.svg) assets, recolored to

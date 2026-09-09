@@ -85,7 +85,7 @@
   (box
     :visible {provider.state != "disabled"}
     :class "harness-usage__provider harness-usage__provider--${provider.state}"
-    :tooltip "${name}: ${provider.state} · 5h ${provider?.five_hour?.remaining_percentage == 0 ? 0 : (provider?.five_hour?.remaining_percentage ?: "?")}% left · resets in ${provider?.five_hour?.resets_in ?: "?"} · 7d ${provider?.seven_day?.remaining_percentage == 0 ? 0 : (provider?.seven_day?.remaining_percentage ?: "?")}% left · resets in ${provider?.seven_day?.resets_in ?: "?"} · as of ${provider?.age_minutes == 0 ? 0 : (provider?.age_minutes ?: "?")}m ago"
+    :tooltip "${name}: ${provider.state}${(provider?.five_hour ?: "") != "" ? " · 5h ${provider.five_hour.remaining_percentage}% left · resets in ${provider.five_hour.resets_in}" : ""}${(provider?.seven_day ?: "") != "" ? " · 7d ${provider.seven_day.remaining_percentage}% left · resets in ${provider.seven_day.resets_in}" : ""} · as of ${provider?.age_minutes == 0 ? 0 : (provider?.age_minutes ?: "?")}m ago"
     :space-evenly false
     :spacing 3
     (image
@@ -94,7 +94,7 @@
       :fill-svg {kind == "codex" ? "#7B8082" : "#D97757"}
       :image-width 13
       :image-height 13)
-    (label :text "${provider.state == "stale" ? "~" : ""}${provider?.five_hour?.remaining_percentage == 0 ? 0 : (provider?.five_hour?.remaining_percentage ?: "?")}·${provider?.seven_day?.remaining_percentage == 0 ? 0 : (provider?.seven_day?.remaining_percentage ?: "?")}")
+    (label :text "${provider.state == "stale" ? "~" : ""}${(provider?.five_hour ?: "") != "" ? provider.five_hour.remaining_percentage : ""}${(provider?.five_hour ?: "") != "" && (provider?.seven_day ?: "") != "" ? "·" : ""}${(provider?.seven_day ?: "") != "" ? provider.seven_day.remaining_percentage : ""}${(provider?.five_hour ?: "") == "" && (provider?.seven_day ?: "") == "" ? "?" : ""}")
     (label :class "harness-usage__percent" :text "%")))
 
 (defwidget harness-usage [assets]

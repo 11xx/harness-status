@@ -1401,8 +1401,7 @@ fn refresh_codex_usage(now: u64) -> Result<StoredUsage, RefreshError> {
     let limits = response
         .pointer("/result/rateLimits")
         .ok_or(RefreshError::Unavailable)?;
-    let five_hour = parse_active_window(limits.get("primary"));
-    let seven_day = parse_active_window(limits.get("secondary"));
+    let (five_hour, seven_day) = codex_windows(limits, "windowDurationMins", parse_active_window);
     if five_hour.is_none() && seven_day.is_none() {
         return Err(RefreshError::Unavailable);
     }
@@ -1412,6 +1411,31 @@ fn refresh_codex_usage(now: u64) -> Result<StoredUsage, RefreshError> {
         five_hour,
         seven_day,
     })
+}
+
+// Older payloads omit duration; their slots retain the original 5h/7d meaning.
+fn codex_windows(
+    limits: &Value,
+    duration_key: &str,
+    parse: fn(Option<&Value>) -> Option<UsageWindow>,
+) -> (Option<UsageWindow>, Option<UsageWindow>) {
+    let mut five_hour = None;
+    let mut seven_day = None;
+    for (slot, default_minutes) in [("primary", 300), ("secondary", 10080)] {
+        let Some(value) = limits.get(slot).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let minutes = match value.get(duration_key) {
+            None | Some(Value::Null) => Some(default_minutes),
+            Some(duration) => duration.as_u64(),
+        };
+        match minutes {
+            Some(300) => five_hour = parse(Some(value)),
+            Some(10080) => seven_day = parse(Some(value)),
+            _ => {}
+        }
+    }
+    (five_hour, seven_day)
 }
 
 fn parse_active_window(value: Option<&Value>) -> Option<UsageWindow> {
@@ -1602,8 +1626,8 @@ fn read_codex_session_usage(path: &Path) -> io::Result<Option<StoredUsage>> {
         else {
             continue;
         };
-        let five_hour = parse_codex_window(rate_limits.get("primary"));
-        let seven_day = parse_codex_window(rate_limits.get("secondary"));
+        let (five_hour, seven_day) =
+            codex_windows(rate_limits, "window_minutes", parse_codex_window);
         if five_hour.is_some() || seven_day.is_some() {
             found = Some(StoredUsage {
                 updated_at: fs::metadata(path)

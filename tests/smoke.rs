@@ -47,6 +47,7 @@ fn usage_report_normalizes_local_codex_and_claude_windows() {
         .arg("usage")
         .env("CODEX_HOME", &codex_home)
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("XDG_STATE_HOME", dir.join("state"))
         .env("HARNESS_STATUS_USAGE_REFRESH", "0")
         .output()
         .unwrap();
@@ -69,6 +70,7 @@ fn usage_report_normalizes_local_codex_and_claude_windows() {
     let mut ingest = Command::new(binary)
         .args(["usage", "ingest", "claude"])
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("XDG_STATE_HOME", dir.join("state"))
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -84,6 +86,7 @@ fn usage_report_normalizes_local_codex_and_claude_windows() {
         .arg("usage")
         .env("CODEX_HOME", &codex_home)
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("XDG_STATE_HOME", dir.join("state"))
         .env("HARNESS_STATUS_USAGE_REFRESH", "0")
         .output()
         .unwrap();
@@ -173,6 +176,7 @@ printf '\n__HARNESS_STATUS_HTTP__200|'
             .env("PATH", &path)
             .env("CLAUDE_CONFIG_DIR", &claude_dir)
             .env("HARNESS_STATUS_SOCKET", &socket)
+            .env("XDG_STATE_HOME", dir.join("state"))
             .env("FAKE_CODEX_CALLS", &codex_calls)
             .env("FAKE_CURL_ARGS", &curl_args)
             .output()
@@ -197,6 +201,7 @@ printf '\n__HARNESS_STATUS_HTTP__200|'
     let mut ingest = Command::new(binary)
         .args(["usage", "ingest", "claude"])
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("XDG_STATE_HOME", dir.join("state"))
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -237,6 +242,7 @@ printf '\n__HARNESS_STATUS_HTTP__200|'
     let mut ingest = Command::new(binary)
         .args(["usage", "ingest", "claude"])
         .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("XDG_STATE_HOME", dir.join("state"))
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -427,6 +433,78 @@ fn disabling_claude_usage_does_not_disable_codex_refresh() {
     assert_eq!(report["codex"]["state"], "fresh");
     assert_eq!(report["claude"]["state"], "disabled");
     assert_eq!(fs::read_to_string(codex_log).unwrap().lines().count(), 1);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn weekly_only_codex_usage() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-weekly-only-test-{nonce}"));
+    let bin_dir = dir.join("bin");
+    let state_home = dir.join("state");
+    let home = dir.join("home");
+    let codex_log = dir.join("codex-calls");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(state_home.join("harness-status")).unwrap();
+    fs::write(
+        state_home.join("harness-status/claude-usage.disabled"),
+        "disabled\n",
+    )
+    .unwrap();
+    fs::write(
+        bin_dir.join("codex"),
+        "#!/bin/sh\nprintf '%s\\n' called >>\"$FAKE_CODEX_LOG\"\nprintf '%s\\n' '{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":14,\"windowDurationMins\":10080,\"resetsAt\":1999999999},\"secondary\":null}}}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin_dir.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(binary)
+        .arg("usage")
+        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("HARNESS_STATUS_SOCKET", dir.join("status.sock"))
+        .env("FAKE_CODEX_LOG", &codex_log)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["codex"]["state"], "fresh");
+    assert!(report["codex"]["five_hour"].is_null());
+    assert_eq!(report["codex"]["seven_day"]["remaining_percentage"], 86);
+    assert_eq!(report["claude"]["state"], "disabled");
+    assert_eq!(fs::read_to_string(codex_log).unwrap().lines().count(), 1);
+
+    let codex_home = dir.join("codex");
+    fs::create_dir_all(codex_home.join("sessions")).unwrap();
+    fs::write(
+        codex_home.join("sessions/rollout.jsonl"),
+        json!({"payload": {"rate_limits": {
+            "primary": {"used_percent": 100, "window_minutes": 10080,
+                        "resets_at": 1999999999},
+            "secondary": null
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let output = Command::new(binary)
+        .arg("usage")
+        .env("CODEX_HOME", &codex_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("HARNESS_STATUS_SOCKET", codex_home.join("fallback.sock"))
+        .env("HARNESS_STATUS_USAGE_REFRESH", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["codex"]["five_hour"].is_null());
+    assert_eq!(report["codex"]["seven_day"]["remaining_percentage"], 0);
 
     fs::remove_dir_all(dir).unwrap();
 }

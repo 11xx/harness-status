@@ -34,6 +34,7 @@
 (defwidget harness-status-thread [thread spinner glyph]
   (box
     :class "harness-status__thread"
+    :visible {! (thread?.hidden ?: false)}
     :space-evenly false
     (button
       :class "harness-status__indicator harness-status__indicator--${thread.harness} harness-status__indicator--${thread.state} harness-status__indicator--reason-${thread?.reason ?: "none"}"

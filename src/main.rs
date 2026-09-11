@@ -17,6 +17,7 @@ const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const REAP_INTERVAL: Duration = Duration::from_millis(500);
 const SUBSCRIBER_HEARTBEAT: Duration = Duration::from_secs(2);
 const IDLE_AFTER_SECONDS: u64 = 300;
+const HIDE_IDLE_AFTER_SECONDS: u64 = 3600;
 const STATE_VERSION: u32 = 1;
 const CODEX_HOOK_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
 const CODEX_RETIRED_HOOK_EVENTS: [&str; 0] = [];
@@ -365,13 +366,27 @@ struct ThreadView<'a> {
     #[serde(flatten)]
     status: &'a ThreadStatus,
     duration: String,
+    hidden: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Entry {
     status: ThreadStatus,
+    #[serde(default)]
+    idle_since: Option<u64>,
     owner: Option<Owner>,
     transcript: Option<TranscriptCursor>,
+}
+
+impl Entry {
+    fn indicator_hidden(&self, now: u64) -> bool {
+        let idle_since = self
+            .idle_since
+            .unwrap_or_else(|| self.status.updated_at.saturating_add(IDLE_AFTER_SECONDS));
+        self.status.state == "idle"
+            && !self.status.background
+            && now.saturating_sub(idle_since) >= HIDE_IDLE_AFTER_SECONDS
+    }
 }
 
 #[derive(Debug)]
@@ -516,6 +531,7 @@ impl Registry {
                 };
             };
             entry.status.state = "idle".to_owned();
+            entry.idle_since = Some(unix_time_seconds());
             return HookResult {
                 changed: true,
                 notification: None,
@@ -569,6 +585,7 @@ impl Registry {
         {
             let transitioned = entry.status.state != state;
             entry.status.state = state.to_owned();
+            entry.idle_since = None;
             if !cwd.is_empty() {
                 entry.status.cwd = cwd;
                 entry.status.name = name;
@@ -608,6 +625,7 @@ impl Registry {
         }
 
         self.entries.push(Entry {
+            idle_since: None,
             status: ThreadStatus {
                 id: session_id,
                 harness: harness.to_owned(),
@@ -658,6 +676,7 @@ impl Registry {
                 && now.saturating_sub(entry.status.updated_at) >= IDLE_AFTER_SECONDS
             {
                 entry.status.state = "idle".to_owned();
+                entry.idle_since = Some(entry.status.updated_at.saturating_add(IDLE_AFTER_SECONDS));
                 changed = true;
             }
         }
@@ -737,21 +756,23 @@ impl Registry {
     fn snapshot_json(&self, harness: Option<&str>) -> String {
         // Indicator order follows the threads themselves, not the order their
         // events happened to arrive, so a dot keeps its place in the bar.
-        let mut threads: Vec<&ThreadStatus> = self
+        let mut threads: Vec<&Entry> = self
             .entries
             .iter()
             .filter(|entry| harness.is_none_or(|name| entry.status.harness == name))
-            .map(|entry| &entry.status)
             .collect();
         threads.sort_unstable_by(|left, right| {
+            let left = &left.status;
+            let right = &right.status;
             (&left.harness, &left.name, &left.id).cmp(&(&right.harness, &right.name, &right.id))
         });
         let now = unix_time_seconds();
         let threads = threads
             .into_iter()
-            .map(|status| ThreadView {
-                duration: format_duration(status.elapsed_seconds(now)),
-                status,
+            .map(|entry| ThreadView {
+                duration: format_duration(entry.status.elapsed_seconds(now)),
+                hidden: entry.indicator_hidden(now),
+                status: &entry.status,
             })
             .collect();
         serde_json::to_string(&Snapshot { threads }).expect("serializing status cannot fail")
@@ -2990,6 +3011,42 @@ mod tests {
         assert!(ended.changed);
         assert!(ended.notification.is_none());
         assert!(registry.entries.is_empty());
+    }
+
+    #[test]
+    fn idle_visibility_boundary_survives_checkpoints_and_protects_active_states() {
+        let mut registry = Registry::default();
+        registry.apply_hook("claude", event("Stop", None), None);
+        registry.apply_hook("claude", event("Notification", Some("idle_prompt")), None);
+        let entry = &mut registry.entries[0];
+        let since = entry.idle_since.unwrap();
+        assert!(!entry.indicator_hidden(since + 3599));
+        assert!(entry.indicator_hidden(since + 3600));
+        let encoded = serde_json::to_vec(entry).unwrap();
+        let restored: Entry = serde_json::from_slice(&encoded).unwrap();
+        assert!(restored.indicator_hidden(since + 3600));
+        assert_eq!(restored.idle_since, Some(since));
+        entry.status.background = true;
+        assert!(!entry.indicator_hidden(since + 7200));
+        entry.status.background = false;
+        for state in ["working", "attention", "completed"] {
+            entry.status.state = state.to_owned();
+            assert!(!entry.indicator_hidden(since + 7200));
+        }
+    }
+
+    #[test]
+    fn idle_timeout_hides_only_the_indicator_and_activity_restores_it() {
+        let mut registry = Registry::default();
+        registry.apply_hook("claude", event("Stop", None), None);
+        registry.entries[0].status.updated_at -= 4000;
+        registry.settle_quiet_entries();
+        let view: Value = serde_json::from_str(&registry.snapshot_json(None)).unwrap();
+        assert_eq!(view["threads"][0]["hidden"], true);
+        assert_eq!(registry.entries.len(), 1);
+        registry.apply_hook("claude", event("UserPromptSubmit", None), None);
+        let view: Value = serde_json::from_str(&registry.snapshot_json(None)).unwrap();
+        assert_eq!(view["threads"][0]["hidden"], false);
     }
 
     #[test]

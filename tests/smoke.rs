@@ -518,6 +518,70 @@ impl Drop for Follower {
 }
 
 #[test]
+fn idle_timeout_publishes_without_hooks_and_keeps_registry_entries() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let dir = std::env::temp_dir().join(format!("harness-idle-{}-{now}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let socket = dir.join("status.sock");
+    let output = dir.join("stream.jsonl");
+    fs::write(
+        state_path(&socket),
+        json!({
+            "version": 1,
+            "entries": [{
+                "status": {"id": "thread-smoke", "harness": "codex", "state": "idle",
+                    "cwd": "/example", "name": "example", "updated_at": now - 4000},
+                "idle_since": now - 3597, "owner": null, "transcript": null
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let child = Command::new(binary)
+        .args(["codex", "--follow"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdout(fs::File::create(&output).unwrap())
+        .spawn()
+        .unwrap();
+    let _follower = Follower {
+        child,
+        dir: dir.clone(),
+    };
+    wait_for_socket(&socket);
+    assert_eq!(
+        snapshot(binary, &socket, "codex")["threads"][0]["hidden"],
+        false
+    );
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let lines = fs::read_to_string(&output).unwrap();
+        if lines
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|view| view["threads"][0]["hidden"] == true)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle deadline never reached the follow stream"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let view = snapshot(binary, &socket, "codex");
+    assert_eq!(view["threads"].as_array().unwrap().len(), 1);
+    assert_eq!(view["threads"][0]["hidden"], true);
+    send_hook(binary, &socket, "codex", "UserPromptSubmit", None);
+    let view = wait_for_state(binary, &socket, "codex", "working");
+    assert_eq!(view["threads"][0]["hidden"], false);
+}
+
+#[test]
 fn codex_hook_to_jsonl_smoke() {
     let binary = env!("CARGO_BIN_EXE_harness-status");
     let nonce = SystemTime::now()

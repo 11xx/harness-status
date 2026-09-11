@@ -192,9 +192,14 @@ The `state` field is `working`, `completed`, `idle`, or `attention`:
   Pi then ignores its intentional idle settlement until the child result wakes
   the parent. `session_shutdown` removes the entry.
 
-A settled or attention entry remains visible until acknowledged, reused by
-another prompt, or its owning harness process exits. Claude Code and Pi also
-remove it when the session ends cleanly.
+An entry remains in the registry until acknowledged or its owning harness
+process exits. Fresh activity updates the same entry. The `hidden` boolean is
+a presentation hint: it becomes true after one hour in `idle`, unless
+`background` is true. Working and attention entries are never auto-hidden.
+Eww hides the whole thread widget when `hidden` is true; fresh activity makes
+it visible again. The idle clock survives registry-owner restarts. Checkpoints
+without an idle timestamp use five minutes after the last update as its start.
+Claude Code and Pi also remove it when the session ends cleanly.
 
 The optional fields carry what a bar needs beyond the state itself. `reason`
 names why a thread wants the user — `permission`, `elicitation`, `subagent`, or
@@ -395,9 +400,10 @@ animation stays in Eww
 rather than the JSON stream. Completed Codex turns use a small dot, completed
 Claude turns use Claude Code's static `✻`, and completed pi turns use `π`.
 Attention uses a static `!`, or `×` when a turn failed. An idle thread keeps its
-settled glyph at reduced opacity, and a thread whose own work is still running
-carries a trailing `⋯`. The tooltip names the project, the state or the reason
-it wants the user, the model, and the turn's `duration` as the stream already
+settled glyph at reduced opacity for one hour before hiding. A thread whose
+own work is still running stays visible and carries a trailing `⋯`. The tooltip
+names the project, the state or the reason it wants the user, the model, and
+the turn's `duration` as the stream already
 formatted it, so the module needs no timer or clock variable of its own.
 Clicking any state acknowledges the indicator.
 

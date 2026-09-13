@@ -232,12 +232,15 @@ struct TurnReport {
 }
 
 impl TranscriptRecord {
-    /// Claude names the answering model on every assistant record, which keeps
-    /// the reported model correct across an in-session model switch.
-    fn answering_model(&self, harness: &str) -> Option<&str> {
-        (harness == "claude" && self.kind == "assistant")
-            .then_some(self.message.model.as_deref())
-            .flatten()
+    /// Claude names the answering model on assistant records, while Codex
+    /// repeats its active model on every `turn_context` record, including a
+    /// model switch within the same session.
+    fn reported_model(&self, harness: &str) -> Option<&str> {
+        match (harness, self.kind.as_str()) {
+            ("claude", "assistant") => self.message.model.as_deref(),
+            ("codex", "turn_context") => self.payload.model.as_deref(),
+            _ => None,
+        }
     }
 
     /// Each harness marks an abandoned turn in its own transcript vocabulary.
@@ -277,6 +280,8 @@ impl TranscriptRecord {
 struct TranscriptPayload {
     #[serde(rename = "type", default)]
     kind: String,
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     turn_id: Option<String>,
     /// A turn the harness closed with an error of its own carries the error
@@ -2631,7 +2636,7 @@ fn read_transcript_turn(
         let Ok(record) = serde_json::from_str::<TranscriptRecord>(&line) else {
             continue;
         };
-        if let Some(model) = record.answering_model(harness) {
+        if let Some(model) = record.reported_model(harness) {
             report.model = Some(model.to_owned());
         }
         if record.reports_abort(harness, turn_id) {
@@ -3301,6 +3306,7 @@ mod tests {
             kind: "event_msg".to_owned(),
             payload: TranscriptPayload {
                 kind: "task_complete".to_owned(),
+                model: None,
                 turn_id: Some("turn-limit".to_owned()),
                 error: Some(json!({"codex_error_info": "usage_limit_exceeded"})),
             },

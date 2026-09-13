@@ -735,6 +735,63 @@ fn codex_hook_to_jsonl_smoke() {
 }
 
 #[test]
+fn codex_model_switch_updates_a_working_entry() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-codex-model-{nonce}"));
+    fs::create_dir(&dir).unwrap();
+    let socket = dir.join("status.sock");
+    let child = Command::new(binary)
+        .args(["codex", "--follow"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _follower = Follower {
+        child,
+        dir: dir.clone(),
+    };
+    wait_for_socket(&socket);
+
+    let transcript = dir.join("codex-transcript.jsonl");
+    fs::write(&transcript, "{\"type\":\"session_meta\"}\n").unwrap();
+    send_hook(
+        binary,
+        &socket,
+        "codex",
+        "UserPromptSubmit",
+        Some(&transcript),
+    );
+    let working = wait_for_state(binary, &socket, "codex", "working");
+    assert_eq!(working["threads"][0]["model"], "gpt-smoke");
+
+    let mut transcript_file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    writeln!(
+        transcript_file,
+        "{}",
+        json!({
+            "type": "turn_context",
+            "payload": {
+                "cwd": "/tmp/example",
+                "model": "gpt-5.6-luna",
+                "effort": "max"
+            }
+        })
+    )
+    .unwrap();
+
+    let switched = wait_for_model(binary, &socket, "codex", "gpt-5.6-luna");
+    assert_eq!(switched["threads"][0]["state"], "working");
+}
+
+#[test]
 fn codex_usage_limit_turn_settles_as_attention_without_a_stop() {
     let binary = env!("CARGO_BIN_EXE_harness-status");
     let nonce = SystemTime::now()

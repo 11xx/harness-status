@@ -543,6 +543,7 @@ fn idle_timeout_publishes_without_hooks_and_keeps_registry_entries() {
     .unwrap();
     let child = Command::new(binary)
         .args(["codex", "--follow"])
+        .env("CODEX_HOME", dir.join("codex-home"))
         .env("HARNESS_STATUS_SOCKET", &socket)
         .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(fs::File::create(&output).unwrap())
@@ -595,6 +596,7 @@ fn codex_hook_to_jsonl_smoke() {
 
     let child = Command::new(binary)
         .args(["codex", "--follow"])
+        .env("CODEX_HOME", dir.join("codex-home"))
         .env("HARNESS_STATUS_SOCKET", &socket)
         .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(Stdio::null())
@@ -616,6 +618,7 @@ fn codex_hook_to_jsonl_smoke() {
 
     let mut subscriber = Command::new(binary)
         .args(["codex", "--follow"])
+        .env("CODEX_HOME", dir.join("codex-home"))
         .env("HARNESS_STATUS_SOCKET", &socket)
         .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(Stdio::piped())
@@ -675,6 +678,7 @@ fn codex_hook_to_jsonl_smoke() {
 
     let mut replacement = Command::new(binary)
         .args(["codex", "--follow"])
+        .env("CODEX_HOME", dir.join("codex-home"))
         .env("HARNESS_STATUS_SOCKET", &socket)
         .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(Stdio::null())
@@ -697,6 +701,7 @@ fn codex_hook_to_jsonl_smoke() {
 
     let mut final_owner = Command::new(binary)
         .args(["codex", "--follow"])
+        .env("CODEX_HOME", dir.join("codex-home"))
         .env("HARNESS_STATUS_SOCKET", &socket)
         .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(Stdio::null())
@@ -746,6 +751,7 @@ fn codex_model_switch_updates_a_working_entry() {
     let socket = dir.join("status.sock");
     let child = Command::new(binary)
         .args(["codex", "--follow"])
+        .env("CODEX_HOME", dir.join("codex-home"))
         .env("HARNESS_STATUS_SOCKET", &socket)
         .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(Stdio::null())
@@ -792,6 +798,99 @@ fn codex_model_switch_updates_a_working_entry() {
 }
 
 #[test]
+fn codex_active_rollout_without_a_hook_is_published_and_settled() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("hs-codex-discovery-{nonce}"));
+    let codex_home = dir.join("codex-home");
+    let sessions = codex_home.join("sessions/2026/09/13");
+    let bin_dir = dir.join("bin");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let fake_codex = bin_dir.join("codex");
+    fs::write(&fake_codex, "#!/bin/sh\nsleep 60\n").unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut codex = Command::new(&fake_codex)
+        .current_dir(&dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000001";
+    let cwd = dir.to_string_lossy().into_owned();
+    let transcript = sessions.join(format!("rollout-2026-09-13T00-00-00-{session_id}.jsonl"));
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n{}\n{}\n",
+            json!({"type": "session_meta", "payload": {"cwd": cwd.as_str()}}),
+            json!({
+                "type": "turn_context",
+                "payload": {"cwd": cwd.as_str(), "model": "gpt-6-astra", "effort": "medium"}
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-discovered"}
+            })
+        ),
+    )
+    .unwrap();
+    let socket = dir.join("status.sock");
+    let child = Command::new(binary)
+        .args(["codex", "--follow"])
+        .env("CODEX_HOME", &codex_home)
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _follower = Follower {
+        child,
+        dir: dir.clone(),
+    };
+    wait_for_socket(&socket);
+
+    let working = wait_for_state(binary, &socket, "codex", "working");
+    assert_eq!(working["threads"][0]["id"], session_id);
+    assert_eq!(working["threads"][0]["model"], "gpt-6-astra");
+
+    let mut transcript_file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    writeln!(
+        transcript_file,
+        "{}",
+        json!({
+            "type": "turn_context",
+            "payload": {"cwd": cwd.as_str(), "model": "gpt-5.6-luna", "effort": "max"}
+        })
+    )
+    .unwrap();
+    let switched = wait_for_model(binary, &socket, "codex", "gpt-5.6-luna");
+    assert_eq!(switched["threads"][0]["state"], "working");
+
+    writeln!(
+        transcript_file,
+        "{}",
+        json!({
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "turn-discovered"}
+        })
+    )
+    .unwrap();
+    let completed = wait_for_state(binary, &socket, "codex", "completed");
+    assert_eq!(completed["threads"][0]["model"], "gpt-5.6-luna");
+
+    codex.kill().unwrap();
+    codex.wait().unwrap();
+}
+
+#[test]
 fn codex_usage_limit_turn_settles_as_attention_without_a_stop() {
     let binary = env!("CARGO_BIN_EXE_harness-status");
     let nonce = SystemTime::now()
@@ -803,6 +902,7 @@ fn codex_usage_limit_turn_settles_as_attention_without_a_stop() {
     let socket = dir.join("status.sock");
     let child = Command::new(binary)
         .args(["codex", "--follow"])
+        .env("CODEX_HOME", dir.join("codex-home"))
         .env("HARNESS_STATUS_SOCKET", &socket)
         .env("HARNESS_STATUS_NOTIFY", "0")
         .stdout(Stdio::null())
@@ -1072,6 +1172,7 @@ fn notifier_failures_do_not_prevent_publication() {
         let socket = dir.join("status.sock");
         let mut child = Command::new(binary)
             .args(["codex", "--follow"])
+            .env("CODEX_HOME", dir.join("codex-home"))
             .env("HARNESS_STATUS_SOCKET", &socket)
             .env("HARNESS_STATUS_NOTIFY_COMMAND", command)
             .stdout(Stdio::null())
@@ -1110,6 +1211,7 @@ fn slow_notifier_is_killed_and_reaped_without_blocking_publication() {
 
     let child = Command::new(binary)
         .args(["codex", "--follow"])
+        .env("CODEX_HOME", dir.join("codex-home"))
         .env("HARNESS_STATUS_SOCKET", &socket)
         .env("HARNESS_STATUS_NOTIFY_COMMAND", &notifier)
         .stdout(Stdio::null())

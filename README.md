@@ -1,9 +1,9 @@
 # harness-status
 
-`harness-status` turns AI harness lifecycle hooks into a small, stable JSON
-contract for status bars. The process started with `--follow` owns the live
-registry and keeps a tiny volatile restart checkpoint; there is no database,
-history store, wrapper, or persistent daemon.
+`harness-status` turns AI harness lifecycle hooks and Codex activity records
+into a small, stable JSON contract for status bars. The process started with
+`--follow` owns the live registry and keeps a tiny volatile restart checkpoint;
+there is no database, history store, wrapper, or persistent daemon.
 
 The adapters support Codex, Claude Code, and pi behind the same CLI and JSON
 shape. The registry owner can also send generic desktop notifications for
@@ -13,6 +13,7 @@ completed turns and requests for attention.
 
 ```text
 Codex, Claude Code, or pi lifecycle event
+or recent Codex native activity
         |
         | starts `harness-status hook codex|claude|pi`
         v
@@ -32,6 +33,12 @@ The hook command reads the JSON object the harness provides on standard input,
 keeps only status metadata, attempts one non-blocking send, and exits. It
 deliberately returns success when no follower is running so status reporting
 cannot delay or break the harness.
+
+The Codex owner also reconciles a recent rollout when its hook was not
+delivered. A `task_started` record, a later `task_complete` or `turn_aborted`
+record, and a live Codex process in the rollout's recorded directory provide
+the working/completed lifecycle; hooks remain the source for exact transition
+timing and metadata such as background work.
 
 The socket is an ephemeral IPC endpoint at
 `$XDG_RUNTIME_DIR/harness-status.sock`, restricted to the current user. Set
@@ -168,8 +175,12 @@ subscriber rather than ending it, because a status bar cannot restart a
 The `state` field is `working`, `completed`, `idle`, or `attention`:
 
 - Codex and Claude Code `UserPromptSubmit` become `working`, while `Stop`
-  becomes `completed`. A session that has only started, without a submitted
-  prompt, has no entry; non-interactive runs submit a prompt like any other.
+  becomes `completed`. A Codex rollout modified within 30 seconds with a
+  recent `task_started` record,
+  no later native completion or abort, and a live process in its recorded
+  directory is also recovered as `working` when its hook was missed. A session
+  that has only started, without a submitted prompt or active task, has no
+  entry; non-interactive runs submit a prompt like any other.
 - Claude Code's `StopFailure` becomes `attention`. `Notification` also becomes
   `attention` for `permission_prompt`, `elicitation_dialog`, and
   `agent_needs_input`, and returns to `working` for `elicitation_complete` and
@@ -247,12 +258,14 @@ process through `/proc`, the follower removes the entry after
 that process exits.
 
 Neither Codex nor Claude Code emits `Stop` for an Esc interruption, so while a
-turn runs both adapters tail only the records their own hook added to the
-transcript since the turn began. Codex recognizes its turn-abort event, and
-Claude Code an interrupted-message record carrying the same prompt identifier;
-either one retires the entry. Codex's `turn_context` records repeat the active
-model, including after an in-session model switch, so the running entry keeps
-its model current from the transcript tail. Codex also ends a usage-limit turn
+hook-sourced turn runs both adapters tail only the records their own hook added
+to the transcript since the turn began. Codex recognizes its turn-abort event,
+and Claude Code an interrupted-message record carrying the same prompt
+identifier; either one retires the entry. A Codex rollout recovered from its
+native records uses the same tail for later aborts and completions. Codex's
+`turn_context` records repeat the active model, including after an in-session
+model switch, so the running entry keeps its model current from the transcript
+tail. Codex also ends a usage-limit turn
 without a `Stop` hook, naming `usage_limit_exceeded` in its completed event; that
 settles the entry as attention instead of retiring it, because the thread is
 waiting on the user's quota rather than gone. An unknown transcript format fails
@@ -297,7 +310,9 @@ active configuration layers.
 
 Open `/hooks` in Codex once after installing or changing the definition and
 trust both commands. The callbacks are short-lived because Codex command hooks
-run synchronously.
+run synchronously. Codex rollout reconciliation remains available when a
+callback is missed, but it cannot supply hook-only attention or background
+metadata.
 
 T3 Code launches the system Codex app-server with the inherited environment,
 so the same user-level hooks and runtime socket work without wrapping either

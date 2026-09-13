@@ -744,11 +744,20 @@ impl Registry {
             let Some(session_id) = codex_session_id(&path) else {
                 continue;
             };
-            if self.entries.iter().any(|entry| {
-                entry.status.harness == "codex"
-                    && entry.status.id == session_id
-                    && entry.status.state == "working"
-            }) {
+            if let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.status.harness == "codex" && entry.status.id == session_id)
+                && entry.status.state == "working"
+            {
+                if let Some(owner) = codex_owner_for_cwd(&owners, &entry.status.cwd)
+                    && entry.owner.as_ref().is_none_or(|current| {
+                        current.pid != owner.pid || current.start_ticks != owner.start_ticks
+                    })
+                {
+                    entry.owner = Some(owner);
+                    changed = true;
+                }
                 continue;
             }
             let Some(modified_at) = modified_seconds(&path) else {
@@ -769,20 +778,11 @@ impl Registry {
             if is_internal_codex_cwd(cwd, &state_root) {
                 continue;
             }
-            let Some((_, owner)) = owners
-                .iter()
-                .filter(|(process_cwd, _)| process_cwd == Path::new(cwd))
-                .max_by_key(|(_, owner)| owner.start_ticks)
-            else {
+            let Some(owner) = codex_owner_for_cwd(&owners, cwd) else {
                 continue;
             };
-            changed |= self.reconcile_codex_rollout(
-                &session_id,
-                &path,
-                &rollout,
-                owner.clone(),
-                modified_at,
-            );
+            changed |=
+                self.reconcile_codex_rollout(&session_id, &path, &rollout, owner, modified_at);
         }
         changed
     }
@@ -1950,6 +1950,14 @@ fn codex_process_owners() -> Vec<(PathBuf, Owner)> {
         }
     }
     processes
+}
+
+fn codex_owner_for_cwd(owners: &[(PathBuf, Owner)], cwd: &str) -> Option<Owner> {
+    owners
+        .iter()
+        .filter(|(process_cwd, _)| process_cwd == Path::new(cwd))
+        .max_by_key(|(_, owner)| owner.start_ticks)
+        .map(|(_, owner)| owner.clone())
 }
 
 fn is_codex_app_server(pid: u32) -> bool {

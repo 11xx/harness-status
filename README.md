@@ -250,15 +250,17 @@ Neither Codex nor Claude Code emits `Stop` for an Esc interruption, so while a
 turn runs both adapters tail only the records their own hook added to the
 transcript since the turn began. Codex recognizes its turn-abort event, and
 Claude Code an interrupted-message record carrying the same prompt identifier;
-either one retires the entry. Codex also ends a usage-limit turn without a
-`Stop` hook, naming `usage_limit_exceeded` in its completed event; that settles
-the entry as attention instead of retiring it, because the thread is waiting on
-the user's quota rather than gone. An unknown transcript format fails safely and
-leaves the click-to-ack fallback. A replacement owner rewinds the transcript
+either one retires the entry. Codex's `turn_context` records repeat the active
+model, including after an in-session model switch, so the running entry keeps
+its model current from the transcript tail. Codex also ends a usage-limit turn
+without a `Stop` hook, naming `usage_limit_exceeded` in its completed event; that
+settles the entry as attention instead of retiring it, because the thread is
+waiting on the user's quota rather than gone. An unknown transcript format fails
+safely and leaves the click-to-ack fallback. A replacement owner rewinds the transcript
 cursors of running Codex turns before its first tail pass, so checkpoints saved
 by an older binary are re-read from the turn's beginning and turns the older
-binary missed the end of still settle correctly. Claude's assistant records also name the
-answering model, which is how a Claude entry reports a model at all and how it
+binary missed the end of still settle correctly. Claude's assistant records also
+name the answering model, which is how a Claude entry reports a model at all and
 stays correct across an in-session model switch. Claude's prompt identifier
 serves as its turn ID. Pi reports its active model but has no separate turn ID
 in this contract, and its `agent_settled` event handles an Esc interruption

@@ -3,7 +3,7 @@ use serde_json::{Map, Value, json};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -15,9 +15,11 @@ const DEFAULT_SOCKET_NAME: &str = "harness-status.sock";
 const MAX_DATAGRAM_SIZE: usize = 64 * 1024;
 const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const REAP_INTERVAL: Duration = Duration::from_millis(500);
+const CODEX_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const SUBSCRIBER_HEARTBEAT: Duration = Duration::from_secs(2);
 const IDLE_AFTER_SECONDS: u64 = 300;
 const HIDE_IDLE_AFTER_SECONDS: u64 = 3600;
+const CODEX_RECENT_ACTIVITY_SECONDS: u64 = 30;
 const STATE_VERSION: u32 = 1;
 const CODEX_HOOK_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
 const CODEX_RETIRED_HOOK_EVENTS: [&str; 0] = [];
@@ -206,6 +208,8 @@ struct TranscriptRecord {
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
     payload: TranscriptPayload,
     #[serde(rename = "promptId", default)]
     prompt_id: Option<String>,
@@ -228,7 +232,17 @@ struct TurnReport {
     /// The harness ended the turn with an error of its own, so the entry
     /// settles as attention instead of running on.
     failed: bool,
+    completed: bool,
     model: Option<String>,
+}
+
+#[derive(Default)]
+struct CodexRollout {
+    cwd: Option<String>,
+    model: Option<String>,
+    turn_id: Option<String>,
+    started_at: Option<u64>,
+    active: bool,
 }
 
 impl TranscriptRecord {
@@ -241,6 +255,13 @@ impl TranscriptRecord {
             ("codex", "turn_context") => self.payload.model.as_deref(),
             _ => None,
         }
+    }
+
+    fn reports_completion(&self, harness: &str, turn_id: &str) -> bool {
+        harness == "codex"
+            && self.kind == "event_msg"
+            && self.payload.kind == "task_complete"
+            && self.payload.turn_id.as_deref() == Some(turn_id)
     }
 
     /// Each harness marks an abandoned turn in its own transcript vocabulary.
@@ -280,6 +301,8 @@ impl TranscriptRecord {
 struct TranscriptPayload {
     #[serde(rename = "type", default)]
     kind: String,
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -381,6 +404,8 @@ struct Entry {
     idle_since: Option<u64>,
     owner: Option<Owner>,
     transcript: Option<TranscriptCursor>,
+    #[serde(default)]
+    hookless: bool,
 }
 
 impl Entry {
@@ -615,6 +640,7 @@ impl Registry {
             if is_working || transcript.is_some() {
                 entry.transcript = transcript;
             }
+            entry.hookless = false;
             let notification =
                 (transitioned && notify_transition && matches!(state, "completed" | "attention"))
                     .then(|| Notification {
@@ -646,6 +672,7 @@ impl Registry {
             },
             owner,
             transcript,
+            hookless: false,
         });
         let notification =
             (notify_transition && matches!(state, "completed" | "attention")).then(|| {
@@ -693,6 +720,174 @@ impl Registry {
         self.entries
             .retain(|entry| entry.owner.as_ref().is_none_or(process_matches_owner));
         before != self.entries.len()
+    }
+
+    /// Codex writes enough lifecycle evidence to recover a fresh turn when its
+    /// command hook was not delivered. A live process in the rollout's recorded
+    /// directory keeps this fallback from treating a stale file as active.
+    fn discover_codex_sessions(&mut self) -> bool {
+        let Some(state_root) = codex_state_root() else {
+            return false;
+        };
+        let owners = codex_process_owners();
+        if owners.is_empty() {
+            return false;
+        }
+        let mut files = Vec::new();
+        if collect_jsonl_files(&state_root.join("sessions"), &mut files).is_err() {
+            return false;
+        }
+
+        let now = unix_time_seconds();
+        let mut changed = false;
+        for path in files {
+            let Some(session_id) = codex_session_id(&path) else {
+                continue;
+            };
+            if let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.status.harness == "codex" && entry.status.id == session_id)
+                && entry.status.state == "working"
+            {
+                if let Some(owner) = codex_owner_for_cwd(&owners, &entry.status.cwd)
+                    && entry.owner.as_ref().is_none_or(|current| {
+                        current.pid != owner.pid || current.start_ticks != owner.start_ticks
+                    })
+                {
+                    entry.owner = Some(owner);
+                    changed = true;
+                }
+                continue;
+            }
+            let Some(modified_at) = modified_seconds(&path) else {
+                continue;
+            };
+            if now.saturating_sub(modified_at) > CODEX_RECENT_ACTIVITY_SECONDS {
+                continue;
+            }
+            let Ok(rollout) = read_codex_rollout(&path) else {
+                continue;
+            };
+            if !rollout.active {
+                continue;
+            }
+            let Some(cwd) = rollout.cwd.as_deref().filter(|cwd| !cwd.is_empty()) else {
+                continue;
+            };
+            if is_internal_codex_cwd(cwd, &state_root) {
+                continue;
+            }
+            let Some(owner) = codex_owner_for_cwd(&owners, cwd) else {
+                continue;
+            };
+            changed |=
+                self.reconcile_codex_rollout(&session_id, &path, &rollout, owner, modified_at);
+        }
+        changed
+    }
+
+    fn reconcile_codex_rollout(
+        &mut self,
+        session_id: &str,
+        path: &Path,
+        rollout: &CodexRollout,
+        owner: Owner,
+        modified_at: u64,
+    ) -> bool {
+        let cwd = rollout.cwd.as_deref().unwrap_or_default();
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.status.harness == "codex" && entry.status.id == session_id)
+        {
+            let was_working = entry.status.state == "working";
+            let turn_changed = rollout
+                .turn_id
+                .as_deref()
+                .is_some_and(|turn_id| entry.status.turn_id.as_deref() != Some(turn_id));
+            let new_turn = !was_working || turn_changed;
+            let mut changed = false;
+
+            if !was_working {
+                entry.status.state = "working".to_owned();
+                entry.status.reason = None;
+                entry.status.background = false;
+                entry.idle_since = None;
+                changed = true;
+            }
+            if !cwd.is_empty()
+                && (entry.status.cwd != cwd || entry.status.name != display_name(cwd))
+            {
+                entry.status.cwd = cwd.to_owned();
+                entry.status.name = display_name(cwd);
+                changed = true;
+            }
+            if let Some(model) = rollout.model.as_deref().filter(|model| !model.is_empty())
+                && entry.status.model.as_deref() != Some(model)
+            {
+                entry.status.model = Some(model.to_owned());
+                changed = true;
+            }
+            if let Some(turn_id) = rollout.turn_id.as_deref()
+                && entry.status.turn_id.as_deref() != Some(turn_id)
+            {
+                entry.status.turn_id = Some(turn_id.to_owned());
+                changed = true;
+            }
+            if new_turn {
+                entry.status.started_at = Some(rollout.started_at.unwrap_or(modified_at));
+                entry.hookless = true;
+                changed = true;
+            }
+            let updated_at = entry.status.updated_at.max(modified_at);
+            if entry.status.updated_at != updated_at {
+                entry.status.updated_at = updated_at;
+                changed = true;
+            }
+            if entry.owner.as_ref().is_none_or(|current| {
+                current.pid != owner.pid || current.start_ticks != owner.start_ticks
+            }) {
+                entry.owner = Some(owner);
+                changed = true;
+            }
+            if entry
+                .transcript
+                .as_ref()
+                .is_none_or(|transcript| transcript.path != path)
+            {
+                entry.transcript = Some(TranscriptCursor {
+                    path: path.to_owned(),
+                    offset: 0,
+                });
+                changed = true;
+            }
+            return changed;
+        }
+
+        self.entries.push(Entry {
+            idle_since: None,
+            status: ThreadStatus {
+                id: session_id.to_owned(),
+                harness: "codex".to_owned(),
+                state: "working".to_owned(),
+                cwd: cwd.to_owned(),
+                name: display_name(cwd),
+                model: rollout.model.clone(),
+                turn_id: rollout.turn_id.clone(),
+                reason: None,
+                background: false,
+                started_at: Some(rollout.started_at.unwrap_or(modified_at)),
+                updated_at: modified_at,
+            },
+            owner: Some(owner),
+            transcript: Some(TranscriptCursor {
+                path: path.to_owned(),
+                offset: 0,
+            }),
+            hookless: true,
+        });
+        true
     }
 
     /// A checkpoint saved by a binary that did not yet recognize a codex
@@ -751,6 +946,20 @@ impl Registry {
                     project: entry.status.name.clone(),
                     state: "attention".to_owned(),
                     reason: Some("failure".to_owned()),
+                });
+            }
+            if report.completed && entry.hookless {
+                entry.status.state = "completed".to_owned();
+                entry.status.reason = None;
+                entry.status.background = false;
+                entry.status.updated_at = unix_time_seconds();
+                entry.hookless = false;
+                changed = true;
+                failure = Some(Notification {
+                    harness: entry.status.harness.clone(),
+                    project: entry.status.name.clone(),
+                    state: "completed".to_owned(),
+                    reason: None,
                 });
             }
             true
@@ -1638,6 +1847,129 @@ fn collect_jsonl_files(path: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> 
     Ok(())
 }
 
+fn read_codex_rollout(path: &Path) -> io::Result<CodexRollout> {
+    let file = fs::File::open(path)?;
+    let mut rollout = CodexRollout::default();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let Ok(record) = serde_json::from_str::<TranscriptRecord>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = record.payload.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+            rollout.cwd = Some(cwd.to_owned());
+        }
+        if let Some(model) = record
+            .reported_model("codex")
+            .filter(|model| !model.is_empty())
+        {
+            rollout.model = Some(model.to_owned());
+        }
+        if record.kind != "event_msg" {
+            continue;
+        }
+        match record.payload.kind.as_str() {
+            "task_started" => {
+                rollout.active = true;
+                rollout.turn_id = record.payload.turn_id.clone();
+                rollout.started_at = record_timestamp(&record);
+            }
+            "task_complete" | "turn_aborted" => rollout.active = false,
+            _ => {}
+        }
+    }
+    Ok(rollout)
+}
+
+fn record_timestamp(record: &TranscriptRecord) -> Option<u64> {
+    record
+        .timestamp
+        .as_deref()?
+        .parse::<jiff::Timestamp>()
+        .ok()?
+        .as_second()
+        .try_into()
+        .ok()
+}
+
+fn modified_seconds(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn codex_session_id(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    stem.get(stem.len().checked_sub(36)?..).map(str::to_owned)
+}
+
+fn codex_process_owners() -> Vec<(PathBuf, Owner)> {
+    let Some(uid) = current_uid().and_then(|uid| uid.parse::<u32>().ok()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut processes: Vec<(PathBuf, Owner)> = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !fs::metadata(entry.path()).is_ok_and(|metadata| metadata.uid() == uid) {
+            continue;
+        }
+        let Some(info) = read_process(pid) else {
+            continue;
+        };
+        if info.comm != "codex" || is_codex_app_server(pid) {
+            continue;
+        }
+        let Ok(cwd) = fs::read_link(format!("/proc/{pid}/cwd")) else {
+            continue;
+        };
+        let owner = Owner {
+            pid,
+            start_ticks: info.start_ticks,
+        };
+        if let Some((_, current)) = processes
+            .iter_mut()
+            .find(|(path, current)| path == &cwd && current.start_ticks == owner.start_ticks)
+        {
+            if owner.pid < current.pid {
+                *current = owner;
+            }
+        } else {
+            processes.push((cwd, owner));
+        }
+    }
+    processes
+}
+
+fn codex_owner_for_cwd(owners: &[(PathBuf, Owner)], cwd: &str) -> Option<Owner> {
+    owners
+        .iter()
+        .filter(|(process_cwd, _)| process_cwd == Path::new(cwd))
+        .max_by_key(|(_, owner)| owner.start_ticks)
+        .map(|(_, owner)| owner.clone())
+}
+
+fn is_codex_app_server(pid: u32) -> bool {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .is_some_and(|cmdline| {
+            cmdline
+                .split(|byte| *byte == 0)
+                .any(|argument| argument == b"app-server")
+        })
+}
+
 fn read_codex_session_usage(path: &Path) -> io::Result<Option<StoredUsage>> {
     let file = fs::File::open(path)?;
     let mut found = None;
@@ -2265,10 +2597,12 @@ fn follow_as_owner(
     let notifier = Notifier::from_env();
     let mut registry = load_registry(&state_path);
     registry.rewind_codex_transcripts();
+    registry.discover_codex_sessions();
     registry.follow_running_transcripts();
     registry.reap_dead_owners();
     checkpoint_registry(&state_path, &registry);
     let mut subscribers = Vec::new();
+    let mut next_codex_discovery = Instant::now() + CODEX_DISCOVERY_INTERVAL;
     let initial_json = registry.snapshot_json(harness);
     print_json_if_changed(last_json, initial_json);
 
@@ -2318,6 +2652,10 @@ fn follow_as_owner(
             Err(error) => return Err(error),
         }
 
+        if Instant::now() >= next_codex_discovery {
+            changed |= registry.discover_codex_sessions();
+            next_codex_discovery = Instant::now() + CODEX_DISCOVERY_INTERVAL;
+        }
         let (transcripts_changed, transcript_failure) = registry.follow_running_transcripts();
         changed |= transcripts_changed;
         if notification.is_none() {
@@ -2645,6 +2983,10 @@ fn read_transcript_turn(
         }
         if record.reports_limit_failure(harness, turn_id) {
             report.failed = true;
+            return Ok(report);
+        }
+        if record.reports_completion(harness, turn_id) {
+            report.completed = true;
             return Ok(report);
         }
     }
@@ -3304,8 +3646,10 @@ mod tests {
 
         let limit_record = TranscriptRecord {
             kind: "event_msg".to_owned(),
+            timestamp: None,
             payload: TranscriptPayload {
                 kind: "task_complete".to_owned(),
+                cwd: None,
                 model: None,
                 turn_id: Some("turn-limit".to_owned()),
                 error: Some(json!({"codex_error_info": "usage_limit_exceeded"})),

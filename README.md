@@ -38,7 +38,10 @@ The Codex owner also reconciles a recent rollout when its hook was not
 delivered. A `task_started` record, a later `task_complete` or `turn_aborted`
 record, and a live Codex process in the rollout's recorded directory provide
 the working/completed lifecycle; hooks remain the source for exact transition
-timing and metadata such as background work.
+timing and metadata such as background work. A rollout never reopens a turn
+that has already settled, since it can trail the hook that settled it. A hook
+names its own owning process, while a recovered entry follows the newest Codex
+process in its directory.
 
 The socket is an ephemeral IPC endpoint at
 `$XDG_RUNTIME_DIR/harness-status.sock`, restricted to the current user. Set

@@ -891,6 +891,186 @@ fn codex_active_rollout_without_a_hook_is_published_and_settled() {
 }
 
 #[test]
+fn codex_turn_settled_by_its_hook_stays_settled_before_its_rollout_completes() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let (dir, rollout) = started_codex_rollout("hs-codex-settled");
+    let mut codex = spawn_fake_codex(&dir);
+    let socket = dir.join("status.sock");
+    let _follower = follow_codex(binary, &dir, &socket);
+
+    send_codex_session_hook(
+        binary,
+        &socket,
+        &dir,
+        &rollout,
+        "UserPromptSubmit",
+        codex.id(),
+    );
+    wait_for_state(binary, &socket, "codex", "working");
+    send_codex_session_hook(binary, &socket, &dir, &rollout, "Stop", codex.id());
+    wait_for_state(binary, &socket, "codex", "completed");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        assert_eq!(
+            snapshot(binary, &socket, "codex")["threads"][0]["state"],
+            "completed"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    append_codex_record(
+        &rollout,
+        json!({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-hooked"}}),
+    );
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        snapshot(binary, &socket, "codex")["threads"][0]["state"],
+        "completed"
+    );
+
+    codex.kill().unwrap();
+    codex.wait().unwrap();
+}
+
+#[test]
+fn codex_hook_owner_outlives_a_newer_codex_process_in_its_directory() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let (dir, rollout) = started_codex_rollout("hs-codex-owner");
+    let mut codex = spawn_fake_codex(&dir);
+    let socket = dir.join("status.sock");
+    let _follower = follow_codex(binary, &dir, &socket);
+
+    send_codex_session_hook(
+        binary,
+        &socket,
+        &dir,
+        &rollout,
+        "UserPromptSubmit",
+        codex.id(),
+    );
+    wait_for_state(binary, &socket, "codex", "working");
+
+    let mut sibling = spawn_fake_codex(&dir);
+    thread::sleep(Duration::from_secs(3));
+    let checkpoint: Value =
+        serde_json::from_slice(&fs::read(state_path(&socket)).unwrap()).unwrap();
+    assert_eq!(checkpoint["entries"][0]["owner"]["pid"], codex.id());
+
+    sibling.kill().unwrap();
+    sibling.wait().unwrap();
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        snapshot(binary, &socket, "codex")["threads"][0]["state"],
+        "working"
+    );
+
+    codex.kill().unwrap();
+    codex.wait().unwrap();
+}
+
+const HOOKED_CODEX_SESSION: &str = "00000000-0000-0000-0000-000000000002";
+
+/// A Codex home whose rollout has started `turn-hooked` in the returned
+/// directory and not yet recorded its completion.
+fn started_codex_rollout(prefix: &str) -> (PathBuf, PathBuf) {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("{prefix}-{nonce}"));
+    let sessions = dir.join("codex-home/sessions/2026/09/14");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(dir.join("bin")).unwrap();
+    let rollout = sessions.join(format!(
+        "rollout-2026-09-14T00-00-00-{HOOKED_CODEX_SESSION}.jsonl"
+    ));
+    let cwd = dir.to_string_lossy().into_owned();
+    fs::write(&rollout, "").unwrap();
+    append_codex_record(
+        &rollout,
+        json!({"type": "session_meta", "payload": {"cwd": cwd.as_str()}}),
+    );
+    append_codex_record(
+        &rollout,
+        json!({"type": "turn_context", "payload": {"cwd": cwd.as_str(), "model": "gpt-smoke"}}),
+    );
+    append_codex_record(
+        &rollout,
+        json!({"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-hooked"}}),
+    );
+    (dir, rollout)
+}
+
+fn append_codex_record(rollout: &Path, record: Value) {
+    let mut file = fs::OpenOptions::new().append(true).open(rollout).unwrap();
+    writeln!(file, "{record}").unwrap();
+}
+
+/// A process named `codex` whose working directory is `dir`.
+fn spawn_fake_codex(dir: &Path) -> Child {
+    let fake_codex = dir.join("bin/codex");
+    if !fake_codex.exists() {
+        fs::write(&fake_codex, "#!/bin/sh\nsleep 60\n").unwrap();
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    Command::new(&fake_codex)
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+fn follow_codex(binary: &str, dir: &Path, socket: &Path) -> Follower {
+    let child = Command::new(binary)
+        .args(["codex", "--follow"])
+        .env("CODEX_HOME", dir.join("codex-home"))
+        .env("HARNESS_STATUS_SOCKET", socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_socket(socket);
+    Follower {
+        child,
+        dir: dir.to_owned(),
+    }
+}
+
+fn send_codex_session_hook(
+    binary: &str,
+    socket: &Path,
+    dir: &Path,
+    rollout: &Path,
+    event: &str,
+    owner_pid: u32,
+) {
+    let mut child = Command::new(binary)
+        .args(["hook", "codex"])
+        .env("CODEX_HOME", dir.join("codex-home"))
+        .env("HARNESS_STATUS_SOCKET", socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        child.stdin.take().unwrap(),
+        &json!({
+            "hook_event_name": event,
+            "session_id": HOOKED_CODEX_SESSION,
+            "turn_id": "turn-hooked",
+            "transcript_path": rollout,
+            "cwd": dir,
+            "model": "gpt-smoke",
+            "owner_pid": owner_pid
+        }),
+    )
+    .unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
 fn codex_usage_limit_turn_settles_as_attention_without_a_stop() {
     let binary = env!("CARGO_BIN_EXE_harness-status");
     let nonce = SystemTime::now()

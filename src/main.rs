@@ -750,7 +750,10 @@ impl Registry {
                 .find(|entry| entry.status.harness == "codex" && entry.status.id == session_id)
                 && entry.status.state == "working"
             {
-                if let Some(owner) = codex_owner_for_cwd(&owners, &entry.status.cwd)
+                // A hook names its own process; only a recovered entry follows
+                // the newest Codex process in its directory.
+                if entry.hookless
+                    && let Some(owner) = codex_owner_for_cwd(&owners, &entry.status.cwd)
                     && entry.owner.as_ref().is_none_or(|current| {
                         current.pid != owner.pid || current.start_ticks != owner.start_ticks
                     })
@@ -806,6 +809,11 @@ impl Registry {
                 .turn_id
                 .as_deref()
                 .is_some_and(|turn_id| entry.status.turn_id.as_deref() != Some(turn_id));
+            // A rollout can trail the hook that settled its turn, so only a
+            // later turn reopens a settled entry.
+            if !was_working && !turn_changed {
+                return false;
+            }
             let new_turn = !was_working || turn_changed;
             let mut changed = false;
 

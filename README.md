@@ -72,6 +72,9 @@ with `cargo install --path . --root "$HOME/.local" --force`.
 ## Usage
 
 ```sh
+# Print the orientation guide.
+harness-status guide
+
 # Query the currently running follower.
 harness-status
 harness-status codex
@@ -102,6 +105,10 @@ harness-status usage ingest claude
 harness-status usage enable|disable|toggle
 harness-status ping enable|disable|toggle
 ```
+
+`harness-status guide` prints an orientation in the terminal: the four
+states, what `--follow` streams, the `ack` and `usage` verbs, and which
+harness adapters report non-interactive runs.
 
 `harness-status usage` prints one normalized account-window report for Codex
 and Claude. It asks Codex's supported app-server `account/rateLimits/read`

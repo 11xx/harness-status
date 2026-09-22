@@ -67,6 +67,7 @@ enum Action {
     UsageControl { control: FeatureControl },
     UsageIngest { harness: String },
     PingControl { control: FeatureControl },
+    Guide,
     Help,
     Version,
 }
@@ -1043,6 +1044,10 @@ fn main() {
             CLAUDE_WINDOW_PING_DISABLED_MARKER,
             control,
         ),
+        Action::Guide => {
+            print_guide();
+            Ok(())
+        }
         Action::Help => {
             print_help();
             Ok(())
@@ -1068,6 +1073,7 @@ fn parse_args() -> Result<Action, String> {
     match first.as_str() {
         "-h" | "--help" => no_more_args(args, Action::Help),
         "-V" | "--version" => no_more_args(args, Action::Version),
+        "guide" => no_more_args(args, Action::Guide),
         "hook" => {
             let harness = args
                 .next()
@@ -1155,11 +1161,48 @@ fn no_more_args(mut args: impl Iterator<Item = String>, action: Action) -> Resul
     }
 }
 
+const GUIDE: &str = "\
+harness-status guide
+
+Answers one question: which harness sessions are live, and which want you.
+It reports session state, not a process listing: `completed` means a turn
+settled, and a delegated run's exit status is the launcher's record
+(agent-delegate).
+
+Bare invocation prints one snapshot as JSON; a harness name narrows it.
+Read `state` on each thread:
+  working     a turn is under way
+  completed   the turn settled
+  idle        settled five minutes ago, or Claude Code reported idle
+  attention   the turn wants the user: permission, elicitation, subagent,
+              or failure
+
+A thread stays listed until you acknowledge it, its session ends, or its
+owning process exits. `harness-status ack THREAD_ID` does the first.
+
+Non-interactive runs (codex exec, pi -p, claude -p) are reported by the same
+adapters; pi needs its extension loaded, and Claude Code 2.1.250 sent print
+mode an empty payload. An empty snapshot means no report, not death.
+
+To wait for a change instead of polling, run `--follow`: it owns the registry
+(or subscribes to the process already owning it) and prints one JSON object
+per line as snapshots change.
+
+`harness-status usage` prints normalized Codex and Claude account windows.
+The README documents the full JSON contract.";
+
+fn print_guide() {
+    println!("{GUIDE}");
+}
+
 fn print_help() {
     println!(
         "\
+Run 'harness-status guide' to learn what this answers.
+
 Usage:
   harness-status [HARNESS] [--follow]
+  harness-status guide
   harness-status --follow [HARNESS]
   harness-status hook HARNESS
   harness-status ack THREAD_ID
@@ -1175,6 +1218,7 @@ snapshots as JSONL. With no HARNESS, snapshot and follow modes include all
 configured harnesses.
 
 Commands:
+  guide               Explain the states, --follow, and reading absence
   hook HARNESS        Forward a harness hook event from stdin and exit
   ack THREAD_ID       Remove a thread from the current registry
   install HARNESS     Install the harness integration in its user config

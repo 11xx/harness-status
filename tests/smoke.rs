@@ -1481,6 +1481,47 @@ fn pi_extension_to_jsonl_smoke() {
     wait_for_thread_count(binary, &socket, "pi", 0);
 }
 
+#[test]
+fn guide_explains_follow_and_which_harnesses_report() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let output = Command::new(binary).arg("guide").output().unwrap();
+    assert!(
+        output.status.success(),
+        "guide must exit 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let guide = String::from_utf8(output.stdout).unwrap();
+    assert!(guide.contains("--follow"), "guide must name --follow");
+    let flat = guide.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "Non-interactive runs (codex exec, pi -p, claude -p) are reported by the same adapters"
+        ),
+        "guide must say which harnesses report non-interactive runs: {guide}"
+    );
+}
+
+#[test]
+fn bare_invocation_still_prints_one_json_snapshot() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-guide-test-{nonce}"));
+    fs::create_dir_all(&dir).unwrap();
+    let output = Command::new(binary)
+        .env("HARNESS_STATUS_SOCKET", dir.join("status.sock"))
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout, "{\"threads\":[]}\n");
+    let snapshot: Value = serde_json::from_str(&stdout).unwrap();
+    assert!(snapshot["threads"].is_array());
+}
+
 fn verify_codex_hook_lifecycle(binary: &str, dir: &Path) {
     let codex_home = dir.join("codex-home");
     fs::create_dir(&codex_home).unwrap();

@@ -283,7 +283,7 @@ without a `Stop` hook, naming `usage_limit_exceeded` in its completed event; tha
 settles the entry as attention instead of retiring it, because the thread is
 waiting on the user's quota rather than gone. An unknown transcript format fails
 safely and leaves the click-to-ack fallback. A replacement owner rewinds the transcript
-cursors of running Codex turns before its first tail pass, so checkpoints saved
+cursors of running Codex and Claude turns before its first tail pass, so checkpoints saved
 by an older binary are re-read from the turn's beginning and turns the older
 binary missed the end of still settle correctly. Claude's assistant records also
 name the answering model and effort, which is how a Claude entry reports them and

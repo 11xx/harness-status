@@ -921,14 +921,12 @@ impl Registry {
         true
     }
 
-    /// A checkpoint saved by a binary that did not yet recognize a codex
-    /// failure has tailed its cursors past the closing record. Rewinding the
-    /// codex cursors of running turns lets the first tail pass after an
-    /// upgrade read the whole turn; both codex end-of-turn predicates match on
-    /// the turn's own id, so earlier turns cannot misfire.
-    fn rewind_codex_transcripts(&mut self) {
+    /// Restored running turns replay their transcripts so the first snapshot
+    /// reflects the current model and any end-of-turn record missed by the
+    /// previous owner.
+    fn rewind_running_transcripts(&mut self) {
         for entry in &mut self.entries {
-            if entry.status.harness == "codex"
+            if matches!(entry.status.harness.as_str(), "codex" | "claude")
                 && entry.status.state == "working"
                 && let Some(transcript) = entry.transcript.as_mut()
             {
@@ -2670,7 +2668,7 @@ fn follow_as_owner(
     let state_path = registry_state_path(path);
     let notifier = Notifier::from_env();
     let mut registry = load_registry(&state_path);
-    registry.rewind_codex_transcripts();
+    registry.rewind_running_transcripts();
     registry.discover_codex_sessions();
     registry.follow_running_transcripts();
     registry.reap_dead_owners();
@@ -3849,7 +3847,7 @@ mod tests {
     }
 
     #[test]
-    fn restoring_a_checkpoint_rewinds_codex_running_transcripts() {
+    fn restoring_a_checkpoint_rewinds_running_transcripts() {
         let mut registry = Registry::default();
         let mut start = event("UserPromptSubmit", None);
         start.transcript = Some(TranscriptCursor {
@@ -3877,13 +3875,10 @@ mod tests {
         settled_stop.session_id = "settled".to_owned();
         registry.apply_hook("claude", settled_stop, None);
 
-        registry.rewind_codex_transcripts();
+        registry.rewind_running_transcripts();
         assert_eq!(registry.entries.len(), 3);
         assert_eq!(registry.entries[0].transcript.as_ref().unwrap().offset, 0);
-        assert_eq!(
-            registry.entries[1].transcript.as_ref().unwrap().offset,
-            9_999
-        );
+        assert_eq!(registry.entries[1].transcript.as_ref().unwrap().offset, 0);
         assert_eq!(
             registry.entries[2].transcript.as_ref().unwrap().offset,
             9_999

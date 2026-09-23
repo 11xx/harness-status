@@ -1197,6 +1197,33 @@ fn claude_hook_to_jsonl_smoke() {
         json!({
             "type": "assistant",
             "promptId": "prompt-smoke",
+            "effort": "medium",
+            "message": {"role": "assistant", "model": "claude-smoke-5"}
+        })
+    )
+    .unwrap();
+    wait_for_model(binary, &socket, "claude", "claude-smoke-5#medium");
+
+    writeln!(
+        transcript_file,
+        "{}",
+        json!({
+            "type": "assistant",
+            "promptId": "prompt-smoke",
+            "effort": "low",
+            "perTurnEffort": "high",
+            "message": {"role": "assistant", "model": "claude-smoke-5"}
+        })
+    )
+    .unwrap();
+    wait_for_model(binary, &socket, "claude", "claude-smoke-5#high");
+
+    writeln!(
+        transcript_file,
+        "{}",
+        json!({
+            "type": "assistant",
+            "promptId": "prompt-smoke",
             "message": {"role": "assistant", "model": "claude-smoke-5"}
         })
     )

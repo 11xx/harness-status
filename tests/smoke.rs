@@ -793,7 +793,7 @@ fn codex_model_switch_updates_a_working_entry() {
     )
     .unwrap();
 
-    let switched = wait_for_model(binary, &socket, "codex", "gpt-5.6-luna");
+    let switched = wait_for_model(binary, &socket, "codex", "gpt-5.6-luna#max");
     assert_eq!(switched["threads"][0]["state"], "working");
 }
 
@@ -856,7 +856,7 @@ fn codex_active_rollout_without_a_hook_is_published_and_settled() {
 
     let working = wait_for_state(binary, &socket, "codex", "working");
     assert_eq!(working["threads"][0]["id"], session_id);
-    assert_eq!(working["threads"][0]["model"], "gpt-6-astra");
+    assert_eq!(working["threads"][0]["model"], "gpt-6-astra#medium");
 
     let mut transcript_file = fs::OpenOptions::new()
         .append(true)
@@ -871,7 +871,7 @@ fn codex_active_rollout_without_a_hook_is_published_and_settled() {
         })
     )
     .unwrap();
-    let switched = wait_for_model(binary, &socket, "codex", "gpt-5.6-luna");
+    let switched = wait_for_model(binary, &socket, "codex", "gpt-5.6-luna#max");
     assert_eq!(switched["threads"][0]["state"], "working");
 
     writeln!(
@@ -884,7 +884,7 @@ fn codex_active_rollout_without_a_hook_is_published_and_settled() {
     )
     .unwrap();
     let completed = wait_for_state(binary, &socket, "codex", "completed");
-    assert_eq!(completed["threads"][0]["model"], "gpt-5.6-luna");
+    assert_eq!(completed["threads"][0]["model"], "gpt-5.6-luna#max");
 
     codex.kill().unwrap();
     codex.wait().unwrap();

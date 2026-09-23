@@ -172,6 +172,8 @@ struct HarnessHookInput {
     #[serde(default)]
     model: String,
     #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
     owner_pid: Option<u32>,
     #[serde(default)]
     notification_type: Option<String>,
@@ -250,10 +252,14 @@ impl TranscriptRecord {
     /// Claude names the answering model on assistant records, while Codex
     /// repeats its active model on every `turn_context` record, including a
     /// model switch within the same session.
-    fn reported_model(&self, harness: &str) -> Option<&str> {
+    fn reported_model(&self, harness: &str) -> Option<String> {
         match (harness, self.kind.as_str()) {
-            ("claude", "assistant") => self.message.model.as_deref(),
-            ("codex", "turn_context") => self.payload.model.as_deref(),
+            ("claude", "assistant") => self.message.model.clone(),
+            ("codex", "turn_context") => self
+                .payload
+                .model
+                .as_deref()
+                .map(|model| model_slug(model, self.payload.effort.as_deref())),
             _ => None,
         }
     }
@@ -306,6 +312,8 @@ struct TranscriptPayload {
     cwd: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default)]
     turn_id: Option<String>,
     /// A turn the harness closed with an error of its own carries the error
@@ -1914,7 +1922,7 @@ fn read_codex_rollout(path: &Path) -> io::Result<CodexRollout> {
             .reported_model("codex")
             .filter(|model| !model.is_empty())
         {
-            rollout.model = Some(model.to_owned());
+            rollout.model = Some(model);
         }
         if record.kind != "event_msg" {
             continue;
@@ -2988,7 +2996,7 @@ fn send_hook(harness: &str) {
         turn_id: input.turn_id.or(input.prompt_id),
         transcript,
         cwd: input.cwd,
-        model: input.model,
+        model: model_slug(&input.model, input.effort.as_deref()),
         notification_type: input.notification_type,
         delegated: input.delegated || delegated_process(),
         background: !input.background_tasks.is_empty() || !input.session_crons.is_empty(),
@@ -3027,7 +3035,7 @@ fn read_transcript_turn(
             continue;
         };
         if let Some(model) = record.reported_model(harness) {
-            report.model = Some(model.to_owned());
+            report.model = Some(model);
         }
         if record.reports_abort(harness, turn_id) {
             report.aborted = true;
@@ -3257,6 +3265,13 @@ fn nonempty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+fn model_slug(model: &str, effort: Option<&str>) -> String {
+    match effort.filter(|effort| !effort.is_empty() && !model.contains('#')) {
+        Some(effort) if !model.is_empty() => format!("{model}#{effort}"),
+        _ => model.to_owned(),
+    }
+}
+
 fn unix_time_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3282,6 +3297,14 @@ fn missing_listener(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_slug_keeps_effort_in_the_model_value_when_available() {
+        assert_eq!(model_slug("gpt-6-sol", Some("high")), "gpt-6-sol#high");
+        assert_eq!(model_slug("gpt-6-sol", None), "gpt-6-sol");
+        assert_eq!(model_slug("gpt-6-sol", Some("")), "gpt-6-sol");
+        assert_eq!(model_slug("gpt-6-sol#high", Some("high")), "gpt-6-sol#high");
+    }
 
     #[test]
     fn usage_refresh_backoff_respects_provider_limits() {
@@ -3703,6 +3726,7 @@ mod tests {
                 kind: "task_complete".to_owned(),
                 cwd: None,
                 model: None,
+                effort: None,
                 turn_id: Some("turn-limit".to_owned()),
                 error: Some(json!({"codex_error_info": "usage_limit_exceeded"})),
             },

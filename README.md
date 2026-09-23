@@ -170,7 +170,7 @@ subscriber rather than ending it, because a status bar cannot restart a
       "state": "working",
       "cwd": "/home/alice/projects/example",
       "name": "example",
-      "model": "gpt-5.6-sol",
+      "model": "gpt-5.6-sol#medium",
       "turn_id": "019def...",
       "reason": "permission",
       "background": false,
@@ -181,6 +181,9 @@ subscriber rather than ending it, because a status bar cannot restart a
   ]
 }
 ```
+
+`model` includes the effort as `model#effort` when the harness supplies it.
+When effort is unavailable, it contains the model slug alone.
 
 The `state` field is `working`, `completed`, `idle`, or `attention`:
 

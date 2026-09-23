@@ -213,6 +213,10 @@ struct TranscriptRecord {
     #[serde(default)]
     timestamp: Option<String>,
     #[serde(default)]
+    effort: Option<String>,
+    #[serde(rename = "perTurnEffort", default)]
+    per_turn_effort: Option<String>,
+    #[serde(default)]
     payload: TranscriptPayload,
     #[serde(rename = "promptId", default)]
     prompt_id: Option<String>,
@@ -254,7 +258,17 @@ impl TranscriptRecord {
     /// model switch within the same session.
     fn reported_model(&self, harness: &str) -> Option<String> {
         match (harness, self.kind.as_str()) {
-            ("claude", "assistant") => self.message.model.clone(),
+            ("claude", "assistant") => self
+                .message
+                .model
+                .as_deref()
+                .filter(|model| *model != "<synthetic>")
+                .map(|model| {
+                    model_slug(
+                        model,
+                        self.per_turn_effort.as_deref().or(self.effort.as_deref()),
+                    )
+                }),
             ("codex", "turn_context") => self
                 .payload
                 .model
@@ -3307,6 +3321,17 @@ mod tests {
     }
 
     #[test]
+    fn claude_synthetic_assistant_does_not_replace_the_model() {
+        let record: TranscriptRecord = serde_json::from_value(json!({
+            "type": "assistant",
+            "effort": "high",
+            "message": {"model": "<synthetic>"}
+        }))
+        .unwrap();
+        assert_eq!(record.reported_model("claude"), None);
+    }
+
+    #[test]
     fn usage_refresh_backoff_respects_provider_limits() {
         let now = 1_000;
         let mut refresh = ProviderRefresh::default();
@@ -3722,6 +3747,8 @@ mod tests {
         let limit_record = TranscriptRecord {
             kind: "event_msg".to_owned(),
             timestamp: None,
+            effort: None,
+            per_turn_effort: None,
             payload: TranscriptPayload {
                 kind: "task_complete".to_owned(),
                 cwd: None,

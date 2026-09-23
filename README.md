@@ -276,7 +276,7 @@ to the transcript since the turn began. Codex recognizes its turn-abort event,
 and Claude Code an interrupted-message record carrying the same prompt
 identifier; either one retires the entry. A Codex rollout recovered from its
 native records uses the same tail for later aborts and completions. Codex's
-`turn_context` records repeat the active model, including after an in-session
+`turn_context` records repeat the active model and effort, including after an in-session
 model switch, so the running entry keeps its model current from the transcript
 tail. Codex also ends a usage-limit turn
 without a `Stop` hook, naming `usage_limit_exceeded` in its completed event; that
@@ -286,8 +286,10 @@ safely and leaves the click-to-ack fallback. A replacement owner rewinds the tra
 cursors of running Codex turns before its first tail pass, so checkpoints saved
 by an older binary are re-read from the turn's beginning and turns the older
 binary missed the end of still settle correctly. Claude's assistant records also
-name the answering model, which is how a Claude entry reports a model at all and
-stays correct across an in-session model switch. Claude's prompt identifier
+name the answering model and effort, which is how a Claude entry reports them and
+stays correct across an in-session model or effort switch. Per-turn effort takes
+precedence over session effort, and synthetic error entries do not name a model.
+Claude's prompt identifier
 serves as its turn ID. Pi reports its active model but has no separate turn ID
 in this contract, and its `agent_settled` event handles an Esc interruption
 without transcript inspection.

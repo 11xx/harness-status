@@ -476,9 +476,11 @@ make install
 ```
 
 `BINDIR` and `AI_BINDIR` can override the default destinations, which are
-`$XDG_BIN_HOME` or `~/.local/bin` and its `ai` subdirectory. The systemd
-service invokes `ai-window-ping claude` through `sh -c`, so the user manager's
-`PATH` from `environment.d` is used rather than an absolute helper path.
+`$XDG_BIN_HOME` or `~/.local/bin` and its `ai` subdirectory. Scheduling the
+helper is external configuration; the repository ships no systemd unit. A user
+service that runs it should invoke `ai-window-ping claude` through `sh -c`, so
+the user manager's `PATH` from `environment.d` resolves the helper rather than
+an absolute path.
 
 ## Verification
 

@@ -1861,12 +1861,17 @@ fn parse_claude_api_window(value: Option<&Value>) -> Option<UsageWindow> {
     usage_window(value.get("utilization")?.as_f64()?, resets_at)
 }
 
+/// `Retry-After` is either delay-seconds or an HTTP-date (RFC 9110).
 fn parse_retry_after(value: &str, now: u64) -> Option<u64> {
-    if let Ok(seconds) = value.trim().parse::<u64>() {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
         return Some(seconds);
     }
-    let timestamp = value.trim().parse::<jiff::Timestamp>().ok()?.as_second() as u64;
-    Some(timestamp.saturating_sub(now))
+    let timestamp = jiff::fmt::rfc2822::DateTimeParser::new()
+        .parse_timestamp(value)
+        .ok()?
+        .as_second();
+    Some(u64::try_from(timestamp).ok()?.saturating_sub(now))
 }
 
 fn usage_window(percentage: f64, resets_at: u64) -> Option<UsageWindow> {
@@ -3367,7 +3372,7 @@ mod tests {
         assert_eq!(window.resets_at, 1_999_999_999);
         assert_eq!(parse_retry_after("240", 1_000), Some(240));
         assert_eq!(
-            parse_retry_after("2033-05-18T03:33:19Z", 1_999_999_000),
+            parse_retry_after("Wed, 18 May 2033 03:33:19 GMT", 1_999_999_000),
             Some(999)
         );
     }

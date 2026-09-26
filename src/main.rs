@@ -1345,7 +1345,7 @@ fn print_usage_report() -> io::Result<()> {
             write_usage_cache(&path, &cache)?;
         }
     }
-    let codex = provider_usage(cache.codex.or(read_codex_usage()?), now);
+    let codex = provider_usage(newest_codex_usage(cache.codex, now), now);
     let claude = if claude_enabled {
         provider_usage(cache.claude, now)
     } else {
@@ -1363,6 +1363,22 @@ fn print_usage_report() -> io::Result<()> {
         serde_json::to_string(&report).map_err(io::Error::other)?
     );
     Ok(())
+}
+
+/// A fresh cached value stands on its own. Otherwise the session events are
+/// scanned, best effort, and the newer observation wins.
+fn newest_codex_usage(cached: Option<StoredUsage>, now: u64) -> Option<StoredUsage> {
+    if cached
+        .as_ref()
+        .is_some_and(|usage| now.saturating_sub(usage.updated_at) <= USAGE_FRESH_SECONDS)
+    {
+        return cached;
+    }
+    let session = read_codex_usage().ok().flatten();
+    [cached, session]
+        .into_iter()
+        .flatten()
+        .max_by_key(|usage| usage.updated_at)
 }
 
 fn active_refresh_enabled() -> bool {
@@ -1896,7 +1912,7 @@ fn read_codex_usage() -> io::Result<Option<StoredUsage>> {
             .unwrap_or(UNIX_EPOCH)
     });
     for path in files.into_iter().rev() {
-        if let Some(usage) = read_codex_session_usage(&path)? {
+        if let Ok(Some(usage)) = read_codex_session_usage(&path) {
             return Ok(Some(usage));
         }
     }

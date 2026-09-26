@@ -509,6 +509,79 @@ fn weekly_only_codex_usage() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// An app-server value cached before refreshes started failing yields to a
+/// newer observation from the Codex session events.
+#[test]
+fn newer_codex_session_usage_replaces_an_older_cached_value() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "harness-status-codex-usage-newer-{}",
+        now.as_nanos()
+    ));
+    let bin_dir = dir.join("bin");
+    let state_home = dir.join("state");
+    let codex_home = dir.join("codex");
+    let sessions = codex_home.join("sessions/2026/09/26");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(state_home.join("harness-status")).unwrap();
+    fs::write(
+        state_home.join("harness-status/claude-usage.disabled"),
+        "disabled\n",
+    )
+    .unwrap();
+    fs::write(bin_dir.join("codex"), "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(bin_dir.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        dir.join("harness-status-usage.json"),
+        json!({
+            "codex": {
+                "updated_at": now.as_secs() - 3600,
+                "authoritative": true,
+                "five_hour": {"used_percentage": 10, "remaining_percentage": 90,
+                              "resets_at": 1999999999_u64},
+                "seven_day": null
+            },
+            "refresh": {"codex": {"next_at": 0, "failures": 3}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        sessions.join("rollout.jsonl"),
+        json!({
+            "timestamp": jiff::Timestamp::now().to_string(),
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "primary": {"used_percent": 22.4, "resets_at": 1999999999_u64},
+                    "secondary": {"used_percent": 35.0, "resets_at": 1999999999_u64}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(binary)
+        .arg("usage")
+        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+        .env("CODEX_HOME", &codex_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("HARNESS_STATUS_SOCKET", dir.join("status.sock"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["codex"]["state"], "fresh");
+    assert_eq!(report["codex"]["five_hour"]["used_percentage"], 22);
+    assert_eq!(report["codex"]["seven_day"]["used_percentage"], 35);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// A session's rate-limit observation is as old as the event that carried it,
 /// however recently other records were appended to the same rollout.
 #[test]

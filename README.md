@@ -130,8 +130,10 @@ The five-hour Claude window ping has its own control:
 calling Claude when that marker exists.
 
 Normal client activity remains the fastest update path. Codex session events
-seed the report when the app server is unavailable, while Claude's status line
-passes its already-delivered payload to `harness-status usage ingest claude`.
+seed the report when the app server is unavailable, and a session observation
+newer than the cached app-server value replaces it; each observation is dated
+by its own event. Claude's status line passes its already-delivered payload to
+`harness-status usage ingest claude`.
 Passive Claude payloads fill windows that are missing from the cache but do not
 overwrite complete values obtained from the authoritative usage endpoint.
 The cache and provider refresh deadlines live in a user-private runtime file,

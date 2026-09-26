@@ -509,8 +509,9 @@ fn weekly_only_codex_usage() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// An app-server value cached before refreshes started failing yields to a
-/// newer observation from the Codex session events.
+/// An app-server value cached before refreshes started failing, here because
+/// `codex` is missing from PATH, yields to a newer observation from the Codex
+/// session events.
 #[test]
 fn newer_codex_session_usage_replaces_an_older_cached_value() {
     let binary = env!("CARGO_BIN_EXE_harness-status");
@@ -531,8 +532,6 @@ fn newer_codex_session_usage_replaces_an_older_cached_value() {
         "disabled\n",
     )
     .unwrap();
-    fs::write(bin_dir.join("codex"), "#!/bin/sh\nexit 1\n").unwrap();
-    fs::set_permissions(bin_dir.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(
         dir.join("harness-status-usage.json"),
         json!({
@@ -567,7 +566,7 @@ fn newer_codex_session_usage_replaces_an_older_cached_value() {
 
     let output = Command::new(binary)
         .arg("usage")
-        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+        .env("PATH", &bin_dir)
         .env("CODEX_HOME", &codex_home)
         .env("XDG_STATE_HOME", &state_home)
         .env("HARNESS_STATUS_SOCKET", dir.join("status.sock"))

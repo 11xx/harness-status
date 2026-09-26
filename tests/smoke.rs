@@ -1016,6 +1016,29 @@ fn codex_model_switch_updates_a_working_entry() {
 
     let switched = wait_for_model(binary, &socket, "codex", "gpt-5.6-luna#max");
     assert_eq!(switched["threads"][0]["state"], "working");
+
+    // A later hook naming the same model without an effort keeps the effort.
+    let mut stop = Command::new(binary)
+        .args(["hook", "codex"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        stop.stdin.take().unwrap(),
+        &json!({
+            "hook_event_name": "Stop",
+            "session_id": "thread-smoke",
+            "turn_id": "turn-smoke",
+            "cwd": "/tmp/example",
+            "model": "gpt-5.6-luna"
+        }),
+    )
+    .unwrap();
+    assert!(stop.wait().unwrap().success());
+    let completed = wait_for_state(binary, &socket, "codex", "completed");
+    assert_eq!(completed["threads"][0]["model"], "gpt-5.6-luna#max");
 }
 
 #[test]

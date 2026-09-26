@@ -187,7 +187,8 @@ subscriber rather than ending it, because a status bar cannot restart a
 ```
 
 `model` includes the effort as `model#effort` when the harness supplies it.
-When effort is unavailable, it contains the model slug alone.
+When effort is unavailable, it contains the model slug alone. A later event
+that names the same model without an effort keeps the effort already known.
 
 The `state` field is `working`, `completed`, `idle`, or `attention`:
 

@@ -643,8 +643,10 @@ impl Registry {
                 entry.status.cwd = cwd;
                 entry.status.name = name;
             }
-            if model.is_some() {
-                entry.status.model = model;
+            if let Some(model) = model
+                && !refines_model(entry.status.model.as_deref(), &model)
+            {
+                entry.status.model = Some(model);
             }
             // Events that carry no turn identity leave the running turn's
             // alone, so interrupt detection survives an interaction.
@@ -3340,6 +3342,14 @@ fn model_slug(model: &str, effort: Option<&str>) -> String {
     }
 }
 
+/// Whether `current` already names `incoming` with an effort that
+/// `incoming` omits, so replacing it would only lose the effort.
+fn refines_model(current: Option<&str>, incoming: &str) -> bool {
+    current
+        .and_then(|current| current.split_once('#'))
+        .is_some_and(|(model, _)| model == incoming)
+}
+
 fn unix_time_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3372,6 +3382,15 @@ mod tests {
         assert_eq!(model_slug("gpt-6-sol", None), "gpt-6-sol");
         assert_eq!(model_slug("gpt-6-sol", Some("")), "gpt-6-sol");
         assert_eq!(model_slug("gpt-6-sol#high", Some("high")), "gpt-6-sol#high");
+    }
+
+    #[test]
+    fn a_model_without_effort_does_not_replace_the_same_model_with_one() {
+        assert!(refines_model(Some("gpt-6-sol#high"), "gpt-6-sol"));
+        assert!(!refines_model(Some("gpt-6-sol#high"), "gpt-6-luna"));
+        assert!(!refines_model(Some("gpt-6-sol#high"), "gpt-6-sol#low"));
+        assert!(!refines_model(Some("gpt-6-sol"), "gpt-6-sol"));
+        assert!(!refines_model(None, "gpt-6-sol"));
     }
 
     #[test]

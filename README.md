@@ -136,8 +136,10 @@ by its own event. Claude's status line passes its already-delivered payload to
 `harness-status usage ingest claude`.
 Passive Claude payloads fill windows that are missing from the cache but do not
 overwrite complete values obtained from the authoritative usage endpoint.
-The cache and provider refresh deadlines live in a user-private runtime file,
-and an advisory lock coalesces concurrent readers across bars and reloads. A
+The cache and provider refresh deadlines live in a user-private runtime file.
+An advisory lock coalesces concurrent readers across bars and reloads; it
+guards only cache reads and writes, never a provider request, so a passive
+payload waits for it briefly rather than being dropped. A
 provider observation older than five minutes is `stale`; its last known values
 remain present with their age. Missing data is `unavailable`, not zero. A
 Claude `429` honors `Retry-After` and otherwise backs off from three to six,

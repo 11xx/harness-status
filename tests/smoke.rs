@@ -509,6 +509,50 @@ fn weekly_only_codex_usage() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// A passive Claude payload that arrives while another process holds the usage
+/// lock waits for it instead of being dropped.
+#[test]
+fn claude_usage_ingest_waits_for_a_held_lock() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-ingest-lock-{nonce}"));
+    fs::create_dir_all(&dir).unwrap();
+    let lock = fs::File::create(dir.join("harness-status-usage.lock")).unwrap();
+    lock.lock().unwrap();
+
+    let mut ingest = Command::new(binary)
+        .args(["usage", "ingest", "claude"])
+        .env("HARNESS_STATUS_SOCKET", dir.join("status.sock"))
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    ingest
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({"rate_limits": {
+                "five_hour": {"used_percentage": 47.6, "resets_at": 1999999999_u64}
+            }})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    drop(lock);
+    assert!(ingest.wait().unwrap().success());
+
+    let cache: Value =
+        serde_json::from_slice(&fs::read(dir.join("harness-status-usage.json")).unwrap()).unwrap();
+    assert_eq!(cache["claude"]["five_hour"]["used_percentage"], 48);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// Without a runtime directory the usage cache and lock share the temporary
 /// directory with every user, so their names carry the uid as the socket's does.
 #[test]

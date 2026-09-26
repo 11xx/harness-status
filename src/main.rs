@@ -1316,34 +1316,30 @@ fn print_usage_report() -> io::Result<()> {
     let path = usage_state_path()?;
     let mut cache = read_usage_cache(&path)?;
     if active_refresh_enabled()
-        && let Some(_lock) = try_usage_lock()?
+        && let Some(due) = claim_due_refreshes(&path, claude_enabled, now)?
     {
+        let codex = due.codex.then(|| refresh_codex_usage(now));
+        let claude = due.claude.then(|| refresh_claude_usage(now));
+        let _lock = usage_lock()?;
         cache = read_usage_cache(&path)?;
-        let mut changed = false;
-        if cache.refresh.codex.next_at <= now {
-            changed = true;
-            match refresh_codex_usage(now) {
-                Ok(usage) => {
-                    cache.codex = Some(usage);
-                    refresh_succeeded(&mut cache.refresh.codex, now);
-                }
-                Err(error) => refresh_failed(&mut cache.refresh.codex, now, error),
+        match codex {
+            Some(Ok(usage)) => {
+                cache.codex = Some(usage);
+                refresh_succeeded(&mut cache.refresh.codex, now);
             }
+            Some(Err(error)) => refresh_failed(&mut cache.refresh.codex, now, error),
+            None => {}
         }
-        if claude_enabled && cache.refresh.claude.next_at <= now {
-            changed = true;
-            match refresh_claude_usage(now) {
-                Ok(usage) => {
-                    let previous = cache.claude.take();
-                    cache.claude = Some(merge_usage(usage, previous));
-                    refresh_succeeded(&mut cache.refresh.claude, now);
-                }
-                Err(error) => refresh_failed(&mut cache.refresh.claude, now, error),
+        match claude {
+            Some(Ok(usage)) => {
+                let previous = cache.claude.take();
+                cache.claude = Some(merge_usage(usage, previous));
+                refresh_succeeded(&mut cache.refresh.claude, now);
             }
+            Some(Err(error)) => refresh_failed(&mut cache.refresh.claude, now, error),
+            None => {}
         }
-        if changed {
-            write_usage_cache(&path, &cache)?;
-        }
+        write_usage_cache(&path, &cache)?;
     }
     let codex = provider_usage(newest_codex_usage(cache.codex, now), now);
     let claude = if claude_enabled {
@@ -1381,6 +1377,41 @@ fn newest_codex_usage(cached: Option<StoredUsage>, now: u64) -> Option<StoredUsa
         .max_by_key(|usage| usage.updated_at)
 }
 
+struct DueRefreshes {
+    codex: bool,
+    claude: bool,
+}
+
+/// Claims each provider whose refresh is due by pushing its deadline one
+/// interval ahead, so concurrent readers skip it while the claimant's
+/// requests run outside the lock. The claimant settles the real deadline
+/// once they finish.
+fn claim_due_refreshes(
+    path: &Path,
+    claude_enabled: bool,
+    now: u64,
+) -> io::Result<Option<DueRefreshes>> {
+    let Some(_lock) = try_usage_lock()? else {
+        return Ok(None);
+    };
+    let mut cache = read_usage_cache(path)?;
+    let due = DueRefreshes {
+        codex: cache.refresh.codex.next_at <= now,
+        claude: claude_enabled && cache.refresh.claude.next_at <= now,
+    };
+    if !due.codex && !due.claude {
+        return Ok(None);
+    }
+    if due.codex {
+        cache.refresh.codex.next_at = now + USAGE_REFRESH_SECONDS;
+    }
+    if due.claude {
+        cache.refresh.claude.next_at = now + USAGE_REFRESH_SECONDS;
+    }
+    write_usage_cache(path, &cache)?;
+    Ok(Some(due))
+}
+
 fn active_refresh_enabled() -> bool {
     env::var_os("HARNESS_STATUS_USAGE_REFRESH").as_deref() != Some(std::ffi::OsStr::new("0"))
 }
@@ -1412,9 +1443,7 @@ fn ingest_usage(harness: &str) -> io::Result<()> {
     if stored.five_hour.is_none() && stored.seven_day.is_none() {
         return Ok(());
     }
-    let Some(_lock) = try_usage_lock()? else {
-        return Ok(());
-    };
+    let _lock = usage_lock()?;
     let path = usage_state_path()?;
     let mut cache = read_usage_cache(&path)?;
     cache.claude = Some(merge_usage(stored, cache.claude.take()));
@@ -1619,20 +1648,32 @@ fn usage_lock_path() -> io::Result<PathBuf> {
     usage_runtime_path(USAGE_LOCK_FILE)
 }
 
+/// The usage lock guards only reads and writes of the cache, never a
+/// provider request, so waiting for it is brief.
+fn usage_lock() -> io::Result<fs::File> {
+    let file = open_usage_lock()?;
+    file.lock()?;
+    Ok(file)
+}
+
 fn try_usage_lock() -> io::Result<Option<fs::File>> {
-    let path = usage_lock_path()?;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let file = open_usage_lock()?;
     match file.try_lock() {
         Ok(()) => Ok(Some(file)),
         Err(fs::TryLockError::WouldBlock) => Ok(None),
         Err(fs::TryLockError::Error(error)) => Err(error),
     }
+}
+
+fn open_usage_lock() -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(usage_lock_path()?)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 fn read_usage_cache(path: &Path) -> io::Result<UsageCache> {

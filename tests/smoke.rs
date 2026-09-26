@@ -414,7 +414,14 @@ fn disabling_claude_usage_does_not_disable_codex_refresh() {
     .unwrap();
     fs::write(
         bin_dir.join("codex"),
-        "#!/bin/sh\nprintf '%s\\n' called >>\"$FAKE_CODEX_LOG\"\nprintf '%s\\n' '{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":12,\"resetsAt\":1999999999},\"secondary\":{\"usedPercent\":34,\"resetsAt\":1999999999}}}}'\n",
+        r#"#!/bin/sh
+printf '%s\n' called >>"$FAKE_CODEX_LOG"
+while IFS= read -r line; do
+  case "$line" in
+    *account/rateLimits/read*) printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":12,"resetsAt":1999999999},"secondary":{"usedPercent":34,"resetsAt":1999999999}}}}' ;;
+  esac
+done
+"#,
     )
     .unwrap();
     fs::set_permissions(bin_dir.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -459,7 +466,14 @@ fn weekly_only_codex_usage() {
     .unwrap();
     fs::write(
         bin_dir.join("codex"),
-        "#!/bin/sh\nprintf '%s\\n' called >>\"$FAKE_CODEX_LOG\"\nprintf '%s\\n' '{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":14,\"windowDurationMins\":10080,\"resetsAt\":1999999999},\"secondary\":null}}}'\n",
+        r#"#!/bin/sh
+printf '%s\n' called >>"$FAKE_CODEX_LOG"
+while IFS= read -r line; do
+  case "$line" in
+    *account/rateLimits/read*) printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":14,"windowDurationMins":10080,"resetsAt":1999999999},"secondary":null}}}' ;;
+  esac
+done
+"#,
     )
     .unwrap();
     fs::set_permissions(bin_dir.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();

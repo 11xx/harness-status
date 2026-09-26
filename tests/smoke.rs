@@ -1863,6 +1863,7 @@ fn verify_codex_hook_lifecycle(binary: &str, dir: &Path) {
 
     verify_uninstall_leaves_no_empty_hooks(binary, dir);
     verify_uninstall_keeps_a_config_holding_nothing_of_ours(binary, dir);
+    verify_uninstall_needs_no_executable_on_path(binary, dir);
 }
 
 /// A config that held only our handlers keeps no hollow `hooks` object once
@@ -1911,6 +1912,38 @@ fn verify_uninstall_keeps_a_config_holding_nothing_of_ours(binary: &str, dir: &P
         .unwrap();
     assert!(uninstall.status.success());
     assert_eq!(fs::read_to_string(&hooks_path).unwrap(), original);
+}
+
+/// Uninstall removes hooks that point at an executable which is gone, since
+/// that is when a user most needs to remove them.
+fn verify_uninstall_needs_no_executable_on_path(binary: &str, dir: &Path) {
+    let codex_home = dir.join("codex-home-missing-executable");
+    fs::create_dir(&codex_home).unwrap();
+    let hooks_path = codex_home.join("hooks.json");
+    let (_, path_env) = test_path(dir);
+    let install = Command::new(binary)
+        .args(["install", "codex"])
+        .env("CODEX_HOME", &codex_home)
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+
+    let empty_path = dir.join("empty-path");
+    fs::create_dir_all(&empty_path).unwrap();
+    let uninstall = Command::new(binary)
+        .args(["uninstall", "codex"])
+        .env("CODEX_HOME", &codex_home)
+        .env("PATH", &empty_path)
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let document: Value = serde_json::from_slice(&fs::read(&hooks_path).unwrap()).unwrap();
+    assert!(document.get("hooks").is_none());
 }
 
 fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {

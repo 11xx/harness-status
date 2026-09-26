@@ -2064,12 +2064,17 @@ fn read_codex_session_usage(path: &Path) -> io::Result<Option<StoredUsage>> {
         let (five_hour, seven_day) =
             codex_windows(rate_limits, "window_minutes", parse_codex_window);
         if five_hour.is_some() || seven_day.is_some() {
+            // The observation is as old as its own record; the file's mtime
+            // stands in only for a record that carries no timestamp.
+            let observed_at = record
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(|timestamp| timestamp.parse::<jiff::Timestamp>().ok())
+                .and_then(|timestamp| u64::try_from(timestamp.as_second()).ok())
+                .or_else(|| modified_seconds(path))
+                .unwrap_or_else(unix_time_seconds);
             found = Some(StoredUsage {
-                updated_at: fs::metadata(path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                    .map_or_else(unix_time_seconds, |duration| duration.as_secs()),
+                updated_at: observed_at,
                 authoritative: true,
                 five_hour,
                 seven_day,

@@ -509,6 +509,59 @@ fn weekly_only_codex_usage() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// A session's rate-limit observation is as old as the event that carried it,
+/// however recently other records were appended to the same rollout.
+#[test]
+fn codex_session_usage_ages_from_its_rate_limit_event() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let dir =
+        std::env::temp_dir().join(format!("harness-status-codex-usage-age-{}", now.as_nanos()));
+    let codex_home = dir.join("codex");
+    let sessions = codex_home.join("sessions/2026/09/26");
+    fs::create_dir_all(&sessions).unwrap();
+    let observed_at = jiff::Timestamp::from_second(now.as_secs() as i64 - 3600).unwrap();
+    fs::write(
+        sessions.join("rollout.jsonl"),
+        format!(
+            "{}\n{}\n",
+            json!({
+                "timestamp": observed_at.to_string(),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "primary": {"used_percent": 22.4, "resets_at": 1999999999_u64},
+                        "secondary": {"used_percent": 35.0, "resets_at": 1999999999_u64}
+                    }
+                }
+            }),
+            json!({
+                "timestamp": jiff::Timestamp::now().to_string(),
+                "type": "event_msg",
+                "payload": {"type": "agent_message"}
+            })
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(binary)
+        .arg("usage")
+        .env("CODEX_HOME", &codex_home)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("HARNESS_STATUS_SOCKET", dir.join("status.sock"))
+        .env("HARNESS_STATUS_USAGE_REFRESH", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["codex"]["state"], "stale");
+    assert_eq!(report["codex"]["age_minutes"], 60);
+    assert_eq!(report["codex"]["five_hour"]["used_percentage"], 22);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
 impl Drop for Follower {
     fn drop(&mut self) {
         let _ = self.child.kill();

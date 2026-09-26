@@ -414,7 +414,14 @@ fn disabling_claude_usage_does_not_disable_codex_refresh() {
     .unwrap();
     fs::write(
         bin_dir.join("codex"),
-        "#!/bin/sh\nprintf '%s\\n' called >>\"$FAKE_CODEX_LOG\"\nprintf '%s\\n' '{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":12,\"resetsAt\":1999999999},\"secondary\":{\"usedPercent\":34,\"resetsAt\":1999999999}}}}'\n",
+        r#"#!/bin/sh
+printf '%s\n' called >>"$FAKE_CODEX_LOG"
+while IFS= read -r line; do
+  case "$line" in
+    *account/rateLimits/read*) printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":12,"resetsAt":1999999999},"secondary":{"usedPercent":34,"resetsAt":1999999999}}}}' ;;
+  esac
+done
+"#,
     )
     .unwrap();
     fs::set_permissions(bin_dir.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -459,7 +466,14 @@ fn weekly_only_codex_usage() {
     .unwrap();
     fs::write(
         bin_dir.join("codex"),
-        "#!/bin/sh\nprintf '%s\\n' called >>\"$FAKE_CODEX_LOG\"\nprintf '%s\\n' '{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":14,\"windowDurationMins\":10080,\"resetsAt\":1999999999},\"secondary\":null}}}'\n",
+        r#"#!/bin/sh
+printf '%s\n' called >>"$FAKE_CODEX_LOG"
+while IFS= read -r line; do
+  case "$line" in
+    *account/rateLimits/read*) printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":14,"windowDurationMins":10080,"resetsAt":1999999999},"secondary":null}}}' ;;
+  esac
+done
+"#,
     )
     .unwrap();
     fs::set_permissions(bin_dir.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -505,6 +519,227 @@ fn weekly_only_codex_usage() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(report["codex"]["five_hour"].is_null());
     assert_eq!(report["codex"]["seven_day"]["remaining_percentage"], 0);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A passive Claude payload that arrives while another process holds the usage
+/// lock waits for it instead of being dropped.
+#[test]
+fn claude_usage_ingest_waits_for_a_held_lock() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-ingest-lock-{nonce}"));
+    fs::create_dir_all(&dir).unwrap();
+    let lock = fs::File::create(dir.join("harness-status-usage.lock")).unwrap();
+    lock.lock().unwrap();
+
+    let mut ingest = Command::new(binary)
+        .args(["usage", "ingest", "claude"])
+        .env("HARNESS_STATUS_SOCKET", dir.join("status.sock"))
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    ingest
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({"rate_limits": {
+                "five_hour": {"used_percentage": 47.6, "resets_at": 1999999999_u64}
+            }})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    drop(lock);
+    assert!(ingest.wait().unwrap().success());
+
+    let cache: Value =
+        serde_json::from_slice(&fs::read(dir.join("harness-status-usage.json")).unwrap()).unwrap();
+    assert_eq!(cache["claude"]["five_hour"]["used_percentage"], 48);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Without a runtime directory the usage cache and lock share the temporary
+/// directory with every user, so their names carry the uid as the socket's does.
+#[test]
+fn usage_files_in_the_shared_temp_directory_are_named_per_user() {
+    use std::os::unix::fs::MetadataExt;
+
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-shared-tmp-{nonce}"));
+    fs::create_dir_all(&dir).unwrap();
+    let uid = fs::metadata(&dir).unwrap().uid();
+
+    let mut ingest = Command::new(binary)
+        .args(["usage", "ingest", "claude"])
+        .env_remove("HARNESS_STATUS_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", &dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    ingest
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({"rate_limits": {
+                "five_hour": {"used_percentage": 47.6, "resets_at": 1999999999_u64}
+            }})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    assert!(ingest.wait().unwrap().success());
+
+    assert!(
+        dir.join(format!("harness-status-{uid}-usage.json"))
+            .is_file()
+    );
+    assert!(
+        dir.join(format!("harness-status-{uid}-usage.lock"))
+            .is_file()
+    );
+    assert!(!dir.join("harness-status-usage.json").exists());
+    assert!(!dir.join("harness-status-usage.lock").exists());
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// An app-server value cached before refreshes started failing, here because
+/// `codex` is missing from PATH, yields to a newer observation from the Codex
+/// session events.
+#[test]
+fn newer_codex_session_usage_replaces_an_older_cached_value() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "harness-status-codex-usage-newer-{}",
+        now.as_nanos()
+    ));
+    let bin_dir = dir.join("bin");
+    let state_home = dir.join("state");
+    let codex_home = dir.join("codex");
+    let sessions = codex_home.join("sessions/2026/09/26");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(state_home.join("harness-status")).unwrap();
+    fs::write(
+        state_home.join("harness-status/claude-usage.disabled"),
+        "disabled\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("harness-status-usage.json"),
+        json!({
+            "codex": {
+                "updated_at": now.as_secs() - 3600,
+                "authoritative": true,
+                "five_hour": {"used_percentage": 10, "remaining_percentage": 90,
+                              "resets_at": 1999999999_u64},
+                "seven_day": null
+            },
+            "refresh": {"codex": {"next_at": 0, "failures": 3}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        sessions.join("rollout.jsonl"),
+        json!({
+            "timestamp": jiff::Timestamp::now().to_string(),
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "primary": {"used_percent": 22.4, "resets_at": 1999999999_u64},
+                    "secondary": {"used_percent": 35.0, "resets_at": 1999999999_u64}
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = Command::new(binary)
+        .arg("usage")
+        .env("PATH", &bin_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("HARNESS_STATUS_SOCKET", dir.join("status.sock"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["codex"]["state"], "fresh");
+    assert_eq!(report["codex"]["five_hour"]["used_percentage"], 22);
+    assert_eq!(report["codex"]["seven_day"]["used_percentage"], 35);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A session's rate-limit observation is as old as the event that carried it,
+/// however recently other records were appended to the same rollout.
+#[test]
+fn codex_session_usage_ages_from_its_rate_limit_event() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let dir =
+        std::env::temp_dir().join(format!("harness-status-codex-usage-age-{}", now.as_nanos()));
+    let codex_home = dir.join("codex");
+    let sessions = codex_home.join("sessions/2026/09/26");
+    fs::create_dir_all(&sessions).unwrap();
+    let observed_at = jiff::Timestamp::from_second(now.as_secs() as i64 - 3600).unwrap();
+    fs::write(
+        sessions.join("rollout.jsonl"),
+        format!(
+            "{}\n{}\n",
+            json!({
+                "timestamp": observed_at.to_string(),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "primary": {"used_percent": 22.4, "resets_at": 1999999999_u64},
+                        "secondary": {"used_percent": 35.0, "resets_at": 1999999999_u64}
+                    }
+                }
+            }),
+            json!({
+                "timestamp": jiff::Timestamp::now().to_string(),
+                "type": "event_msg",
+                "payload": {"type": "agent_message"}
+            })
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(binary)
+        .arg("usage")
+        .env("CODEX_HOME", &codex_home)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("HARNESS_STATUS_SOCKET", dir.join("status.sock"))
+        .env("HARNESS_STATUS_USAGE_REFRESH", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["codex"]["state"], "stale");
+    assert_eq!(report["codex"]["age_minutes"], 60);
+    assert_eq!(report["codex"]["five_hour"]["used_percentage"], 22);
 
     fs::remove_dir_all(dir).unwrap();
 }
@@ -795,6 +1030,29 @@ fn codex_model_switch_updates_a_working_entry() {
 
     let switched = wait_for_model(binary, &socket, "codex", "gpt-5.6-luna#max");
     assert_eq!(switched["threads"][0]["state"], "working");
+
+    // A later hook naming the same model without an effort keeps the effort.
+    let mut stop = Command::new(binary)
+        .args(["hook", "codex"])
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        stop.stdin.take().unwrap(),
+        &json!({
+            "hook_event_name": "Stop",
+            "session_id": "thread-smoke",
+            "turn_id": "turn-smoke",
+            "cwd": "/tmp/example",
+            "model": "gpt-5.6-luna"
+        }),
+    )
+    .unwrap();
+    assert!(stop.wait().unwrap().success());
+    let completed = wait_for_state(binary, &socket, "codex", "completed");
+    assert_eq!(completed["threads"][0]["model"], "gpt-5.6-luna#max");
 }
 
 #[test]
@@ -1642,6 +1900,7 @@ fn verify_codex_hook_lifecycle(binary: &str, dir: &Path) {
 
     verify_uninstall_leaves_no_empty_hooks(binary, dir);
     verify_uninstall_keeps_a_config_holding_nothing_of_ours(binary, dir);
+    verify_uninstall_needs_no_executable_on_path(binary, dir);
 }
 
 /// A config that held only our handlers keeps no hollow `hooks` object once
@@ -1690,6 +1949,38 @@ fn verify_uninstall_keeps_a_config_holding_nothing_of_ours(binary: &str, dir: &P
         .unwrap();
     assert!(uninstall.status.success());
     assert_eq!(fs::read_to_string(&hooks_path).unwrap(), original);
+}
+
+/// Uninstall removes hooks that point at an executable which is gone, since
+/// that is when a user most needs to remove them.
+fn verify_uninstall_needs_no_executable_on_path(binary: &str, dir: &Path) {
+    let codex_home = dir.join("codex-home-missing-executable");
+    fs::create_dir(&codex_home).unwrap();
+    let hooks_path = codex_home.join("hooks.json");
+    let (_, path_env) = test_path(dir);
+    let install = Command::new(binary)
+        .args(["install", "codex"])
+        .env("CODEX_HOME", &codex_home)
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+
+    let empty_path = dir.join("empty-path");
+    fs::create_dir_all(&empty_path).unwrap();
+    let uninstall = Command::new(binary)
+        .args(["uninstall", "codex"])
+        .env("CODEX_HOME", &codex_home)
+        .env("PATH", &empty_path)
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let document: Value = serde_json::from_slice(&fs::read(&hooks_path).unwrap()).unwrap();
+    assert!(document.get("hooks").is_none());
 }
 
 fn verify_claude_hook_lifecycle(binary: &str, dir: &Path) {

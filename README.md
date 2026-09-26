@@ -130,12 +130,16 @@ The five-hour Claude window ping has its own control:
 calling Claude when that marker exists.
 
 Normal client activity remains the fastest update path. Codex session events
-seed the report when the app server is unavailable, while Claude's status line
-passes its already-delivered payload to `harness-status usage ingest claude`.
+seed the report when the app server is unavailable, and a session observation
+newer than the cached app-server value replaces it; each observation is dated
+by its own event. Claude's status line passes its already-delivered payload to
+`harness-status usage ingest claude`.
 Passive Claude payloads fill windows that are missing from the cache but do not
 overwrite complete values obtained from the authoritative usage endpoint.
-The cache and provider refresh deadlines live in a user-private runtime file,
-and an advisory lock coalesces concurrent readers across bars and reloads. A
+The cache and provider refresh deadlines live in a user-private runtime file.
+An advisory lock coalesces concurrent readers across bars and reloads; it
+guards only cache reads and writes, never a provider request, so a passive
+payload waits for it briefly rather than being dropped. A
 provider observation older than five minutes is `stale`; its last known values
 remain present with their age. Missing data is `unavailable`, not zero. A
 Claude `429` honors `Retry-After` and otherwise backs off from three to six,
@@ -183,7 +187,8 @@ subscriber rather than ending it, because a status bar cannot restart a
 ```
 
 `model` includes the effort as `model#effort` when the harness supplies it.
-When effort is unavailable, it contains the model slug alone.
+When effort is unavailable, it contains the model slug alone. A later event
+that names the same model without an effort keeps the effort already known.
 
 The `state` field is `working`, `completed`, `idle`, or `attention`:
 
@@ -471,9 +476,11 @@ make install
 ```
 
 `BINDIR` and `AI_BINDIR` can override the default destinations, which are
-`$XDG_BIN_HOME` or `~/.local/bin` and its `ai` subdirectory. The systemd
-service invokes `ai-window-ping claude` through `sh -c`, so the user manager's
-`PATH` from `environment.d` is used rather than an absolute helper path.
+`$XDG_BIN_HOME` or `~/.local/bin` and its `ai` subdirectory. Scheduling the
+helper is external configuration; the repository ships no systemd unit. A user
+service that runs it should invoke `ai-window-ping claude` through `sh -c`, so
+the user manager's `PATH` from `environment.d` resolves the helper rather than
+an absolute path.
 
 ## Verification
 

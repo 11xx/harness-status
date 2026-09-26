@@ -42,8 +42,8 @@ const PI_EXTENSION_SOURCE: &str = include_str!("../pi/harness-status.ts");
 const USAGE_FRESH_SECONDS: u64 = 5 * 60;
 const USAGE_REFRESH_SECONDS: u64 = 3 * 60;
 const USAGE_BACKOFF_MAX_SECONDS: u64 = 15 * 60;
-const USAGE_STATE_FILE: &str = "harness-status-usage.json";
-const USAGE_LOCK_FILE: &str = "harness-status-usage.lock";
+const USAGE_STATE_FILE: &str = "usage.json";
+const USAGE_LOCK_FILE: &str = "usage.lock";
 const FEATURE_STATE_DIR: &str = "harness-status";
 const CLAUDE_USAGE_DISABLED_MARKER: &str = "claude-usage.disabled";
 const CLAUDE_WINDOW_PING_DISABLED_MARKER: &str = "claude-window-ping.disabled";
@@ -643,8 +643,10 @@ impl Registry {
                 entry.status.cwd = cwd;
                 entry.status.name = name;
             }
-            if model.is_some() {
-                entry.status.model = model;
+            if let Some(model) = model
+                && !refines_model(entry.status.model.as_deref(), &model)
+            {
+                entry.status.model = Some(model);
             }
             // Events that carry no turn identity leave the running turn's
             // alone, so interrupt detection survives an interaction.
@@ -1316,36 +1318,32 @@ fn print_usage_report() -> io::Result<()> {
     let path = usage_state_path()?;
     let mut cache = read_usage_cache(&path)?;
     if active_refresh_enabled()
-        && let Some(_lock) = try_usage_lock()?
+        && let Some(due) = claim_due_refreshes(&path, claude_enabled, now)?
     {
+        let codex = due.codex.then(|| refresh_codex_usage(now));
+        let claude = due.claude.then(|| refresh_claude_usage(now));
+        let _lock = usage_lock()?;
         cache = read_usage_cache(&path)?;
-        let mut changed = false;
-        if cache.refresh.codex.next_at <= now {
-            changed = true;
-            match refresh_codex_usage(now) {
-                Ok(usage) => {
-                    cache.codex = Some(usage);
-                    refresh_succeeded(&mut cache.refresh.codex, now);
-                }
-                Err(error) => refresh_failed(&mut cache.refresh.codex, now, error),
+        match codex {
+            Some(Ok(usage)) => {
+                cache.codex = Some(usage);
+                refresh_succeeded(&mut cache.refresh.codex, now);
             }
+            Some(Err(error)) => refresh_failed(&mut cache.refresh.codex, now, error),
+            None => {}
         }
-        if claude_enabled && cache.refresh.claude.next_at <= now {
-            changed = true;
-            match refresh_claude_usage(now) {
-                Ok(usage) => {
-                    let previous = cache.claude.take();
-                    cache.claude = Some(merge_usage(usage, previous));
-                    refresh_succeeded(&mut cache.refresh.claude, now);
-                }
-                Err(error) => refresh_failed(&mut cache.refresh.claude, now, error),
+        match claude {
+            Some(Ok(usage)) => {
+                let previous = cache.claude.take();
+                cache.claude = Some(merge_usage(usage, previous));
+                refresh_succeeded(&mut cache.refresh.claude, now);
             }
+            Some(Err(error)) => refresh_failed(&mut cache.refresh.claude, now, error),
+            None => {}
         }
-        if changed {
-            write_usage_cache(&path, &cache)?;
-        }
+        write_usage_cache(&path, &cache)?;
     }
-    let codex = provider_usage(cache.codex.or(read_codex_usage()?), now);
+    let codex = provider_usage(newest_codex_usage(cache.codex, now), now);
     let claude = if claude_enabled {
         provider_usage(cache.claude, now)
     } else {
@@ -1363,6 +1361,57 @@ fn print_usage_report() -> io::Result<()> {
         serde_json::to_string(&report).map_err(io::Error::other)?
     );
     Ok(())
+}
+
+/// A fresh cached value stands on its own. Otherwise the session events are
+/// scanned, best effort, and the newer observation wins.
+fn newest_codex_usage(cached: Option<StoredUsage>, now: u64) -> Option<StoredUsage> {
+    if cached
+        .as_ref()
+        .is_some_and(|usage| now.saturating_sub(usage.updated_at) <= USAGE_FRESH_SECONDS)
+    {
+        return cached;
+    }
+    let session = read_codex_usage().ok().flatten();
+    [cached, session]
+        .into_iter()
+        .flatten()
+        .max_by_key(|usage| usage.updated_at)
+}
+
+struct DueRefreshes {
+    codex: bool,
+    claude: bool,
+}
+
+/// Claims each provider whose refresh is due by pushing its deadline one
+/// interval ahead, so concurrent readers skip it while the claimant's
+/// requests run outside the lock. The claimant settles the real deadline
+/// once they finish.
+fn claim_due_refreshes(
+    path: &Path,
+    claude_enabled: bool,
+    now: u64,
+) -> io::Result<Option<DueRefreshes>> {
+    let Some(_lock) = try_usage_lock()? else {
+        return Ok(None);
+    };
+    let mut cache = read_usage_cache(path)?;
+    let due = DueRefreshes {
+        codex: cache.refresh.codex.next_at <= now,
+        claude: claude_enabled && cache.refresh.claude.next_at <= now,
+    };
+    if !due.codex && !due.claude {
+        return Ok(None);
+    }
+    if due.codex {
+        cache.refresh.codex.next_at = now + USAGE_REFRESH_SECONDS;
+    }
+    if due.claude {
+        cache.refresh.claude.next_at = now + USAGE_REFRESH_SECONDS;
+    }
+    write_usage_cache(path, &cache)?;
+    Ok(Some(due))
 }
 
 fn active_refresh_enabled() -> bool {
@@ -1396,9 +1445,7 @@ fn ingest_usage(harness: &str) -> io::Result<()> {
     if stored.five_hour.is_none() && stored.seven_day.is_none() {
         return Ok(());
     }
-    let Some(_lock) = try_usage_lock()? else {
-        return Ok(());
-    };
+    let _lock = usage_lock()?;
     let path = usage_state_path()?;
     let mut cache = read_usage_cache(&path)?;
     cache.claude = Some(merge_usage(stored, cache.claude.take()));
@@ -1533,11 +1580,23 @@ fn format_reset_in(seconds: u64) -> String {
 }
 
 fn usage_state_path() -> io::Result<PathBuf> {
+    usage_runtime_path(USAGE_STATE_FILE)
+}
+
+/// Usage files sit beside the socket. In the shared temporary directory, the
+/// fallback when neither a socket override nor `XDG_RUNTIME_DIR` is set, their
+/// names carry the uid just as the socket's does.
+fn usage_runtime_path(file_name: &str) -> io::Result<PathBuf> {
     let socket = socket_path()?;
-    Ok(socket
-        .parent()
-        .unwrap_or_else(|| Path::new("/tmp"))
-        .join(USAGE_STATE_FILE))
+    let directory = socket.parent().unwrap_or_else(|| Path::new("/tmp"));
+    let shared =
+        env::var_os("HARNESS_STATUS_SOCKET").is_none() && env::var_os("XDG_RUNTIME_DIR").is_none();
+    Ok(if shared {
+        let uid = current_uid().unwrap_or_else(|| "unknown".to_owned());
+        directory.join(format!("harness-status-{uid}-{file_name}"))
+    } else {
+        directory.join(format!("harness-status-{file_name}"))
+    })
 }
 
 fn feature_marker_path(file_name: &str) -> io::Result<PathBuf> {
@@ -1588,27 +1647,35 @@ fn control_feature(label: &str, marker_name: &str, control: FeatureControl) -> i
 }
 
 fn usage_lock_path() -> io::Result<PathBuf> {
-    let socket = socket_path()?;
-    Ok(socket
-        .parent()
-        .unwrap_or_else(|| Path::new("/tmp"))
-        .join(USAGE_LOCK_FILE))
+    usage_runtime_path(USAGE_LOCK_FILE)
+}
+
+/// The usage lock guards only reads and writes of the cache, never a
+/// provider request, so waiting for it is brief.
+fn usage_lock() -> io::Result<fs::File> {
+    let file = open_usage_lock()?;
+    file.lock()?;
+    Ok(file)
 }
 
 fn try_usage_lock() -> io::Result<Option<fs::File>> {
-    let path = usage_lock_path()?;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let file = open_usage_lock()?;
     match file.try_lock() {
         Ok(()) => Ok(Some(file)),
         Err(fs::TryLockError::WouldBlock) => Ok(None),
         Err(fs::TryLockError::Error(error)) => Err(error),
     }
+}
+
+fn open_usage_lock() -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(usage_lock_path()?)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 fn read_usage_cache(path: &Path) -> io::Result<UsageCache> {
@@ -1861,12 +1928,17 @@ fn parse_claude_api_window(value: Option<&Value>) -> Option<UsageWindow> {
     usage_window(value.get("utilization")?.as_f64()?, resets_at)
 }
 
+/// `Retry-After` is either delay-seconds or an HTTP-date (RFC 9110).
 fn parse_retry_after(value: &str, now: u64) -> Option<u64> {
-    if let Ok(seconds) = value.trim().parse::<u64>() {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
         return Some(seconds);
     }
-    let timestamp = value.trim().parse::<jiff::Timestamp>().ok()?.as_second() as u64;
-    Some(timestamp.saturating_sub(now))
+    let timestamp = jiff::fmt::rfc2822::DateTimeParser::new()
+        .parse_timestamp(value)
+        .ok()?
+        .as_second();
+    Some(u64::try_from(timestamp).ok()?.saturating_sub(now))
 }
 
 fn usage_window(percentage: f64, resets_at: u64) -> Option<UsageWindow> {
@@ -1891,7 +1963,7 @@ fn read_codex_usage() -> io::Result<Option<StoredUsage>> {
             .unwrap_or(UNIX_EPOCH)
     });
     for path in files.into_iter().rev() {
-        if let Some(usage) = read_codex_session_usage(&path)? {
+        if let Ok(Some(usage)) = read_codex_session_usage(&path) {
             return Ok(Some(usage));
         }
     }
@@ -2059,12 +2131,17 @@ fn read_codex_session_usage(path: &Path) -> io::Result<Option<StoredUsage>> {
         let (five_hour, seven_day) =
             codex_windows(rate_limits, "window_minutes", parse_codex_window);
         if five_hour.is_some() || seven_day.is_some() {
+            // The observation is as old as its own record; the file's mtime
+            // stands in only for a record that carries no timestamp.
+            let observed_at = record
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(|timestamp| timestamp.parse::<jiff::Timestamp>().ok())
+                .and_then(|timestamp| u64::try_from(timestamp.as_second()).ok())
+                .or_else(|| modified_seconds(path))
+                .unwrap_or_else(unix_time_seconds);
             found = Some(StoredUsage {
-                updated_at: fs::metadata(path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                    .map_or_else(unix_time_seconds, |duration| duration.as_secs()),
+                updated_at: observed_at,
                 authoritative: true,
                 five_hour,
                 seven_day,
@@ -2119,20 +2196,12 @@ fn install_hooks(
     let hooks = hooks_object_mut(root, &display_path)?;
     let mut changed = false;
     for &event in events {
-        changed |= install_event_handler(
-            hooks,
-            event,
-            &target_handler,
-            harness,
-            &command,
-            legacy_command,
-        )?;
+        changed |= install_event_handler(hooks, event, &target_handler, harness, legacy_command)?;
     }
     changed |= remove_managed_events(
         hooks,
         retired_events,
         harness,
-        &command,
         legacy_command,
         &display_path,
     )?;
@@ -2175,7 +2244,6 @@ fn uninstall_hooks(
     }
 
     let mut document = read_hook_document(&path, false)?;
-    let command = hook_command(harness)?;
     let root = root_object_mut(&mut document, &display_path)?;
     let mut changed = false;
     let mut hooks_are_empty = false;
@@ -2185,14 +2253,7 @@ fn uninstall_hooks(
             invalid_hook_config(&display_path, "top-level 'hooks' must be an object")
         })?;
         for list in [events, retired_events] {
-            changed |= remove_managed_events(
-                hooks,
-                list,
-                harness,
-                &command,
-                legacy_command,
-                &display_path,
-            )?;
+            changed |= remove_managed_events(hooks, list, harness, legacy_command, &display_path)?;
         }
         // Ours to drop only when our own removals emptied it. An object that
         // never held anything of ours is not ours to rewrite, and only a write
@@ -2431,7 +2492,6 @@ fn install_event_handler(
     event: &str,
     target_handler: &Value,
     harness: &str,
-    command: &str,
     legacy_command: &str,
 ) -> io::Result<bool> {
     if !hooks.contains_key(event) {
@@ -2451,13 +2511,13 @@ fn install_event_handler(
     let owned: Vec<&Value> = groups
         .iter()
         .flat_map(|group| group["hooks"].as_array().expect("validated hook group"))
-        .filter(|handler| handler_is_owned(handler, harness, command, legacy_command))
+        .filter(|handler| handler_is_owned(handler, harness, legacy_command))
         .collect();
     if owned.len() == 1 && owned[0] == target_handler {
         return Ok(false);
     }
 
-    remove_owned_handlers(groups, event, harness, command, legacy_command)?;
+    remove_owned_handlers(groups, event, harness, legacy_command)?;
     groups.push(json!({ "hooks": [target_handler.clone()] }));
     Ok(true)
 }
@@ -2466,7 +2526,6 @@ fn remove_managed_events(
     hooks: &mut Map<String, Value>,
     events: &[&str],
     harness: &str,
-    command: &str,
     legacy_command: &str,
     display_path: &Path,
 ) -> io::Result<bool> {
@@ -2479,7 +2538,7 @@ fn remove_managed_events(
         let groups = groups_value.as_array_mut().ok_or_else(|| {
             invalid_hook_config(display_path, &format!("hooks.{event} must be an array"))
         })?;
-        changed |= remove_owned_handlers(groups, event, harness, command, legacy_command)? > 0;
+        changed |= remove_owned_handlers(groups, event, harness, legacy_command)? > 0;
         if groups.is_empty() {
             empty_events.push(event);
         }
@@ -2494,7 +2553,6 @@ fn remove_owned_handlers(
     groups: &mut Vec<Value>,
     event: &str,
     harness: &str,
-    command: &str,
     legacy_command: &str,
 ) -> io::Result<usize> {
     validate_event_groups(groups, event)?;
@@ -2502,7 +2560,7 @@ fn remove_owned_handlers(
     for group in groups.iter_mut() {
         let handlers = group["hooks"].as_array_mut().expect("validated hook group");
         handlers.retain(|handler| {
-            if handler_is_owned(handler, harness, command, legacy_command) {
+            if handler_is_owned(handler, harness, legacy_command) {
                 removed += 1;
                 false
             } else {
@@ -2535,15 +2593,15 @@ fn validate_event_groups(groups: &[Value], event: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn handler_is_owned(handler: &Value, harness: &str, command: &str, legacy_command: &str) -> bool {
+/// Ownership is read from the handler alone, so a hook stays recognizable
+/// after the executable it names has moved or been removed.
+fn handler_is_owned(handler: &Value, harness: &str, legacy_command: &str) -> bool {
     handler.get("type").and_then(Value::as_str) == Some("command")
         && handler
             .get("command")
             .and_then(Value::as_str)
             .is_some_and(|candidate| {
-                candidate == command
-                    || candidate == legacy_command
-                    || generated_hook_command(candidate, harness)
+                candidate == legacy_command || generated_hook_command(candidate, harness)
             })
 }
 
@@ -3284,6 +3342,14 @@ fn model_slug(model: &str, effort: Option<&str>) -> String {
     }
 }
 
+/// Whether `current` already names `incoming` with an effort that
+/// `incoming` omits, so replacing it would only lose the effort.
+fn refines_model(current: Option<&str>, incoming: &str) -> bool {
+    current
+        .and_then(|current| current.split_once('#'))
+        .is_some_and(|(model, _)| model == incoming)
+}
+
 fn unix_time_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3316,6 +3382,15 @@ mod tests {
         assert_eq!(model_slug("gpt-6-sol", None), "gpt-6-sol");
         assert_eq!(model_slug("gpt-6-sol", Some("")), "gpt-6-sol");
         assert_eq!(model_slug("gpt-6-sol#high", Some("high")), "gpt-6-sol#high");
+    }
+
+    #[test]
+    fn a_model_without_effort_does_not_replace_the_same_model_with_one() {
+        assert!(refines_model(Some("gpt-6-sol#high"), "gpt-6-sol"));
+        assert!(!refines_model(Some("gpt-6-sol#high"), "gpt-6-luna"));
+        assert!(!refines_model(Some("gpt-6-sol#high"), "gpt-6-sol#low"));
+        assert!(!refines_model(Some("gpt-6-sol"), "gpt-6-sol"));
+        assert!(!refines_model(None, "gpt-6-sol"));
     }
 
     #[test]
@@ -3367,7 +3442,7 @@ mod tests {
         assert_eq!(window.resets_at, 1_999_999_999);
         assert_eq!(parse_retry_after("240", 1_000), Some(240));
         assert_eq!(
-            parse_retry_after("2033-05-18T03:33:19Z", 1_999_999_000),
+            parse_retry_after("Wed, 18 May 2033 03:33:19 GMT", 1_999_999_000),
             Some(999)
         );
     }

@@ -42,8 +42,8 @@ const PI_EXTENSION_SOURCE: &str = include_str!("../pi/harness-status.ts");
 const USAGE_FRESH_SECONDS: u64 = 5 * 60;
 const USAGE_REFRESH_SECONDS: u64 = 3 * 60;
 const USAGE_BACKOFF_MAX_SECONDS: u64 = 15 * 60;
-const USAGE_STATE_FILE: &str = "harness-status-usage.json";
-const USAGE_LOCK_FILE: &str = "harness-status-usage.lock";
+const USAGE_STATE_FILE: &str = "usage.json";
+const USAGE_LOCK_FILE: &str = "usage.lock";
 const FEATURE_STATE_DIR: &str = "harness-status";
 const CLAUDE_USAGE_DISABLED_MARKER: &str = "claude-usage.disabled";
 const CLAUDE_WINDOW_PING_DISABLED_MARKER: &str = "claude-window-ping.disabled";
@@ -1549,11 +1549,23 @@ fn format_reset_in(seconds: u64) -> String {
 }
 
 fn usage_state_path() -> io::Result<PathBuf> {
+    usage_runtime_path(USAGE_STATE_FILE)
+}
+
+/// Usage files sit beside the socket. In the shared temporary directory, the
+/// fallback when neither a socket override nor `XDG_RUNTIME_DIR` is set, their
+/// names carry the uid just as the socket's does.
+fn usage_runtime_path(file_name: &str) -> io::Result<PathBuf> {
     let socket = socket_path()?;
-    Ok(socket
-        .parent()
-        .unwrap_or_else(|| Path::new("/tmp"))
-        .join(USAGE_STATE_FILE))
+    let directory = socket.parent().unwrap_or_else(|| Path::new("/tmp"));
+    let shared =
+        env::var_os("HARNESS_STATUS_SOCKET").is_none() && env::var_os("XDG_RUNTIME_DIR").is_none();
+    Ok(if shared {
+        let uid = current_uid().unwrap_or_else(|| "unknown".to_owned());
+        directory.join(format!("harness-status-{uid}-{file_name}"))
+    } else {
+        directory.join(format!("harness-status-{file_name}"))
+    })
 }
 
 fn feature_marker_path(file_name: &str) -> io::Result<PathBuf> {
@@ -1604,11 +1616,7 @@ fn control_feature(label: &str, marker_name: &str, control: FeatureControl) -> i
 }
 
 fn usage_lock_path() -> io::Result<PathBuf> {
-    let socket = socket_path()?;
-    Ok(socket
-        .parent()
-        .unwrap_or_else(|| Path::new("/tmp"))
-        .join(USAGE_LOCK_FILE))
+    usage_runtime_path(USAGE_LOCK_FILE)
 }
 
 fn try_usage_lock() -> io::Result<Option<fs::File>> {

@@ -509,6 +509,58 @@ fn weekly_only_codex_usage() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// Without a runtime directory the usage cache and lock share the temporary
+/// directory with every user, so their names carry the uid as the socket's does.
+#[test]
+fn usage_files_in_the_shared_temp_directory_are_named_per_user() {
+    use std::os::unix::fs::MetadataExt;
+
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-status-shared-tmp-{nonce}"));
+    fs::create_dir_all(&dir).unwrap();
+    let uid = fs::metadata(&dir).unwrap().uid();
+
+    let mut ingest = Command::new(binary)
+        .args(["usage", "ingest", "claude"])
+        .env_remove("HARNESS_STATUS_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env("TMPDIR", &dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    ingest
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({"rate_limits": {
+                "five_hour": {"used_percentage": 47.6, "resets_at": 1999999999_u64}
+            }})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    assert!(ingest.wait().unwrap().success());
+
+    assert!(
+        dir.join(format!("harness-status-{uid}-usage.json"))
+            .is_file()
+    );
+    assert!(
+        dir.join(format!("harness-status-{uid}-usage.lock"))
+            .is_file()
+    );
+    assert!(!dir.join("harness-status-usage.json").exists());
+    assert!(!dir.join("harness-status-usage.lock").exists());
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// An app-server value cached before refreshes started failing, here because
 /// `codex` is missing from PATH, yields to a newer observation from the Codex
 /// session events.

@@ -55,7 +55,8 @@ bar reloads cannot accumulate abandoned Unix sockets.
 
 ## Build and install
 
-Rust 1.97 or newer is recommended.
+Rust 1.97 or newer is recommended. The checkout's `rust-toolchain.toml` pins
+Rust 1.97.0, which rustup installs on first use.
 
 ```sh
 make install

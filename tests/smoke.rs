@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -133,7 +134,7 @@ fn usage_report_actively_refreshes_once_per_provider_interval() {
     .unwrap();
 
     let codex = bin_dir.join("codex");
-    fs::write(
+    write_executable(
         &codex,
         r##"#!/bin/sh
 printf '%s\n' call >>"$FAKE_CODEX_CALLS"
@@ -145,12 +146,10 @@ while IFS= read -r line; do
   esac
 done
 "##,
-    )
-    .unwrap();
-    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let curl = bin_dir.join("curl");
-    fs::write(
+    write_executable(
         &curl,
         r##"#!/bin/sh
 printf '%s\n' "$*" >>"$FAKE_CURL_ARGS"
@@ -158,9 +157,7 @@ cat >/dev/null
 printf '%s' '{"five_hour":{"utilization":100,"resets_at":"2033-05-18T03:33:19Z"},"seven_day":{"utilization":13,"resets_at":"2033-05-18T03:33:19Z"}}'
 printf '\n__HARNESS_STATUS_HTTP__200|'
 "##,
-    )
-    .unwrap();
-    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let socket = dir.join("status.sock");
     let codex_calls = dir.join("codex-calls");
@@ -292,12 +289,10 @@ fn claude_usage_and_ping_toggles_are_independent_and_reversible() {
     let claude_log = dir.join("claude-calls");
     fs::create_dir_all(&bin_dir).unwrap();
     fs::create_dir_all(&home).unwrap();
-    fs::write(
-        bin_dir.join("claude"),
+    write_executable(
+        &bin_dir.join("claude"),
         "#!/bin/sh\nprintf '%s\\n' invoked >>\"$FAKE_CLAUDE_LOG\"\n",
-    )
-    .unwrap();
-    fs::set_permissions(bin_dir.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let run = |args: &[&str]| {
         Command::new(binary)
@@ -412,8 +407,8 @@ fn disabling_claude_usage_does_not_disable_codex_refresh() {
         "disabled\n",
     )
     .unwrap();
-    fs::write(
-        bin_dir.join("codex"),
+    write_executable(
+        &bin_dir.join("codex"),
         r#"#!/bin/sh
 printf '%s\n' called >>"$FAKE_CODEX_LOG"
 while IFS= read -r line; do
@@ -422,9 +417,7 @@ while IFS= read -r line; do
   esac
 done
 "#,
-    )
-    .unwrap();
-    fs::set_permissions(bin_dir.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let output = Command::new(binary)
         .arg("usage")
@@ -464,8 +457,8 @@ fn weekly_only_codex_usage() {
         "disabled\n",
     )
     .unwrap();
-    fs::write(
-        bin_dir.join("codex"),
+    write_executable(
+        &bin_dir.join("codex"),
         r#"#!/bin/sh
 printf '%s\n' called >>"$FAKE_CODEX_LOG"
 while IFS= read -r line; do
@@ -474,9 +467,7 @@ while IFS= read -r line; do
   esac
 done
 "#,
-    )
-    .unwrap();
-    fs::set_permissions(bin_dir.join("codex"), fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let output = Command::new(binary)
         .arg("usage")
@@ -1070,8 +1061,7 @@ fn codex_active_rollout_without_a_hook_is_published_and_settled() {
     fs::create_dir_all(&bin_dir).unwrap();
 
     let fake_codex = bin_dir.join("codex");
-    fs::write(&fake_codex, "#!/bin/sh\nsleep 60\n").unwrap();
-    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&fake_codex, "#!/bin/sh\nsleep 60\n");
     let mut codex = Command::new(&fake_codex)
         .current_dir(&dir)
         .stdout(Stdio::null())
@@ -1269,8 +1259,7 @@ fn append_codex_record(rollout: &Path, record: Value) {
 fn spawn_fake_codex(dir: &Path) -> Child {
     let fake_codex = dir.join("bin/codex");
     if !fake_codex.exists() {
-        fs::write(&fake_codex, "#!/bin/sh\nsleep 60\n").unwrap();
-        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&fake_codex, "#!/bin/sh\nsleep 60\n");
     }
     Command::new(&fake_codex)
         .current_dir(dir)
@@ -1572,15 +1561,13 @@ fn desktop_notifications_are_generic_and_transition_only() {
     let socket = dir.join("status.sock");
     let output = dir.join("notifications");
     let notifier = dir.join("notifier");
-    fs::write(
+    write_executable(
         &notifier,
-        format!(
+        &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
             output.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&notifier, fs::Permissions::from_mode(0o700)).unwrap();
+    );
 
     let child = Command::new(binary)
         .args(["claude", "--follow"])
@@ -1664,15 +1651,13 @@ fn slow_notifier_is_killed_and_reaped_without_blocking_publication() {
     let socket = dir.join("status.sock");
     let pid_file = dir.join("notifier.pid");
     let notifier = dir.join("notifier");
-    fs::write(
+    write_executable(
         &notifier,
-        format!(
+        &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nexec sleep 30\n",
             pid_file.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&notifier, fs::Permissions::from_mode(0o700)).unwrap();
+    );
 
     let child = Command::new(binary)
         .args(["codex", "--follow"])
@@ -2162,12 +2147,44 @@ fn verify_pi_extension_lifecycle(binary: &str, dir: &Path) {
     fs::remove_file(extension_path).unwrap();
 }
 
+/// Writes an executable file at `path`.
+///
+/// Executing a file fails with `ETXTBSY` while any process holds it open for
+/// writing, and a child forked by another test thread inherits every descriptor
+/// this process has open until that child execs. So the bytes are written by a
+/// short-lived `cat` child, which leaves this process with no writable
+/// descriptor to the file, and the file is complete before anything can spawn
+/// it. It is written under a temporary name, given its mode, and renamed into
+/// place, so `path` never names a partial or non-executable file.
+fn write_executable(path: &Path, contents: &str) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut writer = Command::new("sh")
+        .args(["-c", r#"exec cat >"$1""#, "sh"])
+        .arg(&temporary)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writer
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(contents.as_bytes())
+        .unwrap();
+    assert!(writer.wait().unwrap().success());
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&temporary, path).unwrap();
+}
+
 fn test_path(dir: &Path) -> (PathBuf, std::ffi::OsString) {
     let bin_dir = dir.join("path-bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let executable = bin_dir.join("harness-status");
-    fs::write(&executable, "#!/bin/sh\n").unwrap();
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&executable, "#!/bin/sh\n");
     let path_env = std::env::join_paths([bin_dir.as_path()]).unwrap();
     (executable, path_env)
 }

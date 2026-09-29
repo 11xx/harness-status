@@ -15,6 +15,93 @@ struct Follower {
 }
 
 #[test]
+fn full_reply_queues_do_not_stall_the_owner_or_lose_hook_transitions() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    for operation in ["subscribe", "publish", "resubscribe", "snapshot"] {
+        let dir = PathBuf::from(format!("target/hs-slow-{}-{operation}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let server = dir.join("status.sock");
+        let child = Command::new(binary)
+            .arg("--follow")
+            .env("HARNESS_STATUS_SOCKET", &server)
+            .env("CODEX_HOME", dir.join("codex-home"))
+            .env("CLAUDE_CONFIG_DIR", dir.join("claude-config"))
+            .env("HARNESS_STATUS_NOTIFY", "0")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _follower = Follower {
+            child,
+            dir: dir.clone(),
+        };
+        wait_for_socket(&server);
+        let stalled_path = dir.join("stalled.sock");
+        let stalled = UnixDatagram::bind(&stalled_path).unwrap();
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let healthy = UnixDatagram::bind(dir.join("healthy.sock")).unwrap();
+        healthy
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let subscribe = json!({"op": "subscribe", "harness": "claude"}).to_string();
+        let query = json!({"op": "snapshot", "harness": "claude"}).to_string();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        if matches!(operation, "publish" | "resubscribe") {
+            stalled.send_to(subscribe.as_bytes(), &server).unwrap();
+            stalled
+                .recv(&mut buffer)
+                .expect("initial subscription reply");
+        }
+        fill_datagram_queue(&stalled_path);
+        match operation {
+            "subscribe" | "resubscribe" => {
+                stalled.send_to(subscribe.as_bytes(), &server).unwrap();
+            }
+            "snapshot" => {
+                stalled.send_to(query.as_bytes(), &server).unwrap();
+            }
+            _ => {}
+        }
+
+        send_hook(binary, &server, "claude", "UserPromptSubmit", None);
+        healthy.send_to(query.as_bytes(), &server).unwrap();
+        let length = healthy
+            .recv(&mut buffer)
+            .unwrap_or_else(|error| panic!("owner stalled on {operation}: {error}"));
+        let view: Value = serde_json::from_slice(&buffer[..length]).unwrap();
+        assert_eq!(
+            view["threads"][0]["state"], "working",
+            "{operation}: {view}"
+        );
+
+        stalled.set_nonblocking(true).unwrap();
+        while stalled.recv(&mut buffer).is_ok() {}
+        send_hook(binary, &server, "claude", "Stop", None);
+        healthy.send_to(query.as_bytes(), &server).unwrap();
+        let length = healthy.recv(&mut buffer).unwrap();
+        let view: Value = serde_json::from_slice(&buffer[..length]).unwrap();
+        assert_eq!(
+            view["threads"][0]["state"], "completed",
+            "{operation}: {view}"
+        );
+        assert!(!server.with_extension("hook-failure").exists());
+        assert_eq!(
+            stalled.recv(&mut buffer).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a stalled subscription must be evicted: {operation}"
+        );
+
+        // A follower's heartbeat can subscribe again after it drains its queue.
+        stalled.set_nonblocking(false).unwrap();
+        stalled.send_to(subscribe.as_bytes(), &server).unwrap();
+        let length = stalled.recv(&mut buffer).unwrap();
+        let view: Value = serde_json::from_slice(&buffer[..length]).unwrap();
+        assert_eq!(view["threads"][0]["state"], "completed");
+    }
+}
+
+#[test]
 fn failed_hook_sends_leave_a_bounded_private_marker_and_still_exit_successfully() {
     let binary = env!("CARGO_BIN_EXE_harness-status");
     let dir = PathBuf::from(format!("target/hs-hook-loss-{}", std::process::id()));

@@ -168,8 +168,13 @@ provider-specific contract.
 If no follower is running, snapshot mode prints `{"threads":[]}`. Only one
 follower owns the registry, but any number of later `--follow` processes can
 subscribe to its current snapshot and future changes. Each subscriber keeps
-its own optional harness filter. If the owner exits, subscribers return to
-owner election; one restores the runtime checkpoint and the others resubscribe.
+its own optional harness filter. The owner uses a separate non-blocking socket
+for all client replies, so a full client queue cannot delay receiving hooks.
+It drops snapshot replies that cannot be sent and evicts a subscriber whose
+initial reply, heartbeat reply, or changed snapshot cannot be sent. A follower
+that drains its queue can resubscribe on its next two-second heartbeat.
+If the owner exits, subscribers return to owner election; one restores the
+runtime checkpoint and the others resubscribe.
 Election is contended by design: losing the race to retire a dead owner's
 socket, or querying an owner that answers too slowly, makes a process a
 subscriber rather than ending it, because a status bar cannot restart a

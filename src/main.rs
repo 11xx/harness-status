@@ -223,6 +223,10 @@ struct TranscriptRecord {
     #[serde(rename = "interruptedMessageId", default)]
     interrupted_message_id: Option<String>,
     #[serde(default)]
+    subtype: Option<String>,
+    #[serde(rename = "preventedContinuation", default)]
+    prevented_continuation: bool,
+    #[serde(default)]
     message: TranscriptMessage,
 }
 
@@ -278,11 +282,23 @@ impl TranscriptRecord {
         }
     }
 
+    /// Codex names the turn it completed. Claude records that its Stop hooks
+    /// ran, so the transcript holds the turn's end even when the hook's own
+    /// report never arrives; the caller binds it to the turn.
     fn reports_completion(&self, harness: &str, turn_id: &str) -> bool {
-        harness == "codex"
-            && self.kind == "event_msg"
-            && self.payload.kind == "task_complete"
-            && self.payload.turn_id.as_deref() == Some(turn_id)
+        match harness {
+            "codex" => {
+                self.kind == "event_msg"
+                    && self.payload.kind == "task_complete"
+                    && self.payload.turn_id.as_deref() == Some(turn_id)
+            }
+            "claude" => {
+                self.kind == "system"
+                    && self.subtype.as_deref() == Some("stop_hook_summary")
+                    && !self.prevented_continuation
+            }
+            _ => false,
+        }
     }
 
     /// Each harness marks an abandoned turn in its own transcript vocabulary.
@@ -429,6 +445,9 @@ struct Entry {
     transcript: Option<TranscriptCursor>,
     #[serde(default)]
     hookless: bool,
+    /// A delegated run reports its own completion, so settling it is not news.
+    #[serde(default)]
+    delegated: bool,
 }
 
 impl Entry {
@@ -666,6 +685,7 @@ impl Registry {
                 entry.transcript = transcript;
             }
             entry.hookless = false;
+            entry.delegated = delegated;
             let notification =
                 (transitioned && notify_transition && matches!(state, "completed" | "attention"))
                     .then(|| Notification {
@@ -698,6 +718,7 @@ impl Registry {
             owner,
             transcript,
             hookless: false,
+            delegated,
         });
         let notification =
             (notify_transition && matches!(state, "completed" | "attention")).then(|| {
@@ -919,6 +940,7 @@ impl Registry {
                 offset: 0,
             }),
             hookless: true,
+            delegated: false,
         });
         true
     }
@@ -940,8 +962,9 @@ impl Registry {
     /// Tails each running turn's transcript for the facts a lifecycle hook
     /// never delivers: that the user interrupted the turn, that the harness
     /// ended the turn with an error of its own, and which model answered it.
-    /// An interrupt retires the entry; a harness-reported failure settles it as
-    /// attention, and the notification that transition deserves.
+    /// It also catches an end whose hook never arrived. An interrupt retires
+    /// the entry; a failure or a recovered end settles it, with the
+    /// notification that transition deserves.
     fn follow_running_transcripts(&mut self) -> (bool, Option<Notification>) {
         let before = self.entries.len();
         let mut changed = false;
@@ -979,19 +1002,23 @@ impl Registry {
                     reason: Some("failure".to_owned()),
                 });
             }
-            if report.completed && entry.hookless {
+            // Claude's Stop hook reports the same end, but its report can be
+            // lost on the way; the transcript keeps the record regardless.
+            if report.completed && (entry.hookless || entry.status.harness == "claude") {
                 entry.status.state = "completed".to_owned();
                 entry.status.reason = None;
                 entry.status.background = false;
                 entry.status.updated_at = unix_time_seconds();
                 entry.hookless = false;
                 changed = true;
-                failure = Some(Notification {
-                    harness: entry.status.harness.clone(),
-                    project: entry.status.name.clone(),
-                    state: "completed".to_owned(),
-                    reason: None,
-                });
+                if !entry.delegated {
+                    failure = Some(Notification {
+                        harness: entry.status.harness.clone(),
+                        project: entry.status.name.clone(),
+                        state: "completed".to_owned(),
+                        reason: None,
+                    });
+                }
             }
             true
         });
@@ -3092,6 +3119,9 @@ fn read_transcript_turn(
     file.seek(SeekFrom::Start(cursor.offset))?;
     let mut reader = BufReader::new(file);
     let mut report = TurnReport::default();
+    // A replayed transcript holds earlier turns too; a record that names
+    // another prompt marks what follows as that turn's, not this one's.
+    let mut in_other_turn = false;
 
     loop {
         let mut line = String::new();
@@ -3104,6 +3134,9 @@ fn read_transcript_turn(
         let Ok(record) = serde_json::from_str::<TranscriptRecord>(&line) else {
             continue;
         };
+        if let Some(prompt_id) = record.prompt_id.as_deref() {
+            in_other_turn = prompt_id != turn_id;
+        }
         if let Some(model) = record.reported_model(harness) {
             report.model = Some(model);
         }
@@ -3115,7 +3148,7 @@ fn read_transcript_turn(
             report.failed = true;
             return Ok(report);
         }
-        if record.reports_completion(harness, turn_id) {
+        if record.reports_completion(harness, turn_id) && !in_other_turn {
             report.completed = true;
             return Ok(report);
         }
@@ -3832,6 +3865,8 @@ mod tests {
             },
             prompt_id: None,
             interrupted_message_id: None,
+            subtype: None,
+            prevented_continuation: false,
             message: TranscriptMessage::default(),
         };
         assert!(limit_record.reports_limit_failure("codex", "turn-limit"));
@@ -3901,6 +3936,94 @@ mod tests {
         let (changed, notification) = registry.follow_running_transcripts();
         assert!(!changed);
         assert!(notification.is_none());
+    }
+
+    fn append_records(path: &Path, records: &[Value]) {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for record in records {
+            writeln!(file, "{record}").unwrap();
+        }
+    }
+
+    fn stop_summary(prevented: bool) -> Value {
+        json!({"type": "system", "subtype": "stop_hook_summary", "preventedContinuation": prevented})
+    }
+
+    #[test]
+    fn a_recorded_claude_stop_settles_only_its_own_turn_and_ends_idle() {
+        let transcript = env::temp_dir().join(format!(
+            "harness-status-lost-stop-{}-{}.jsonl",
+            process::id(),
+            unix_time_seconds()
+        ));
+        // A replay from the start passes an earlier turn's stop first.
+        append_records(
+            &transcript,
+            &[
+                json!({"type": "user", "promptId": "turn-old", "message": {"content": "old"}}),
+                stop_summary(false),
+                json!({"type": "user", "promptId": "turn-now", "message": {"content": "now"}}),
+            ],
+        );
+        let mut registry = Registry::default();
+        let mut start = event("UserPromptSubmit", None);
+        start.turn_id = Some("turn-now".to_owned());
+        start.transcript = Some(TranscriptCursor {
+            path: transcript.clone(),
+            offset: 0,
+        });
+        registry.apply_hook("claude", start, None);
+        let (_, notification) = registry.follow_running_transcripts();
+        assert!(notification.is_none());
+        assert_eq!(registry.entries[0].status.state, "working");
+
+        // A Stop hook that blocked the stop keeps the turn going.
+        append_records(&transcript, &[stop_summary(true)]);
+        registry.follow_running_transcripts();
+        assert_eq!(registry.entries[0].status.state, "working");
+
+        append_records(&transcript, &[stop_summary(false)]);
+        let (changed, notification) = registry.follow_running_transcripts();
+        assert!(changed);
+        assert_eq!(registry.entries[0].status.state, "completed");
+        assert_eq!(notification.expect("the end notifies").state, "completed");
+
+        // The late hook finds the turn already settled and adds nothing new.
+        let result = registry.apply_hook("claude", event("Stop", None), None);
+        assert!(result.notification.is_none());
+
+        registry.entries[0].status.updated_at -= IDLE_AFTER_SECONDS;
+        assert!(registry.settle_quiet_entries());
+        assert_eq!(registry.entries[0].status.state, "idle");
+        fs::remove_file(&transcript).unwrap();
+    }
+
+    #[test]
+    fn a_recorded_stop_in_a_delegated_run_settles_without_notifying() {
+        let transcript = env::temp_dir().join(format!(
+            "harness-status-delegated-stop-{}-{}.jsonl",
+            process::id(),
+            unix_time_seconds()
+        ));
+        append_records(&transcript, &[]);
+        let mut registry = Registry::default();
+        let mut start = event_with_delegation("UserPromptSubmit", None, true);
+        start.turn_id = Some("turn-now".to_owned());
+        start.transcript = Some(TranscriptCursor {
+            path: transcript.clone(),
+            offset: 0,
+        });
+        registry.apply_hook("claude", start, None);
+        append_records(&transcript, &[stop_summary(false)]);
+        let (changed, notification) = registry.follow_running_transcripts();
+        assert!(changed);
+        assert!(notification.is_none());
+        assert_eq!(registry.entries[0].status.state, "completed");
+        fs::remove_file(&transcript).unwrap();
     }
 
     #[test]

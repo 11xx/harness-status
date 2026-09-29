@@ -1550,6 +1550,65 @@ fn claude_hook_to_jsonl_smoke() {
 }
 
 #[test]
+fn claude_stop_whose_report_is_lost_settles_from_the_transcript() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-lost-stop-{nonce}"));
+    fs::create_dir(&dir).unwrap();
+    let socket = dir.join("status.sock");
+    let child = Command::new(binary)
+        .args(["claude", "--follow"])
+        .env("CLAUDE_CONFIG_DIR", dir.join("claude-config"))
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _follower = Follower {
+        child,
+        dir: dir.clone(),
+    };
+    wait_for_socket(&socket);
+
+    let transcript = dir.join("claude-transcript.jsonl");
+    fs::write(&transcript, "").unwrap();
+    send_hook(
+        binary,
+        &socket,
+        "claude",
+        "UserPromptSubmit",
+        Some(&transcript),
+    );
+    wait_for_state(binary, &socket, "claude", "working");
+
+    // Claude ran its Stop hook and recorded that it did, but the hook's
+    // report never reached the registry.
+    let mut transcript_file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    for record in [
+        json!({
+            "type": "user",
+            "promptId": "prompt-smoke",
+            "message": {"role": "user", "content": "a prompt"}
+        }),
+        json!({
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 1,
+            "preventedContinuation": false
+        }),
+    ] {
+        writeln!(transcript_file, "{record}").unwrap();
+    }
+    wait_for_state(binary, &socket, "claude", "completed");
+}
+
+#[test]
 fn desktop_notifications_are_generic_and_transition_only() {
     let binary = env!("CARGO_BIN_EXE_harness-status");
     let nonce = SystemTime::now()

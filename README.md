@@ -210,6 +210,11 @@ The `state` field is `working`, `completed`, `idle`, or `attention`:
   turn end. The error code must match exactly: an unknown code has not shown
   what it means, and a turn it belongs to keeps running until a hook says
   otherwise.
+- A hook reports by a datagram it does not wait on, so a report can be lost.
+  Claude Code records in its transcript that its `Stop` hooks ran (a
+  `stop_hook_summary` record that did not prevent continuation), and the
+  transcript tail settles the turn as `completed` from that record when the
+  hook's own report never arrived.
 - A completed thread becomes `idle` once it has waited five minutes, or as soon
   as Claude Code reports its own `idle_prompt`. Waiting is not attention: an
   idle report never creates a thread and never interrupts one that is working.

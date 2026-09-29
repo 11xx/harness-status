@@ -34,6 +34,17 @@ keeps only status metadata, attempts one non-blocking send, and exits. It
 deliberately returns success when no follower is running so status reporting
 cannot delay or break the harness.
 
+If the socket cannot accept a hook, the command makes one best-effort write
+to a private file beside the socket with extension `hook-failure`. The fixed
+33-byte line contains only the Unix timestamp and OS error code of the latest
+failure, including a missing listener or a full socket queue. Successful sends
+leave that marker intact. `harness-status guide` displays its timestamp and
+error code when readable; the snapshot JSON contract stays the same. Recording
+does not lock, retry, sync to disk, or create directories. An unavailable,
+oversized, non-private, symlink, or non-regular diagnostic file is skipped;
+the hook still exits successfully. The marker is bounded diagnostic evidence,
+not a delivery counter or acknowledgement.
+
 The Codex owner also reconciles a recent rollout when its hook was not
 delivered. A `task_started` record, a later `task_complete` or `turn_aborted`
 record, and a live Codex process in the rollout's recorded directory provide

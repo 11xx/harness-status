@@ -15,6 +15,165 @@ struct Follower {
 }
 
 #[test]
+fn failed_hook_sends_leave_a_bounded_private_marker_and_still_exit_successfully() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let dir = PathBuf::from(format!("target/hs-hook-loss-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("status.sock");
+    let marker = socket.with_extension("hook-failure");
+    let _ = fs::remove_file(&marker);
+
+    let run_hook = || {
+        run_hook_with_deadline(binary, &socket);
+    };
+    run_hook();
+    let first = fs::read_to_string(&marker).expect("a missing listener leaves a failure marker");
+    assert_eq!(first.len(), 33);
+    assert_eq!(first.lines().count(), 1);
+    assert_eq!(
+        fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!first.contains("sensitive-secret"));
+    let fields: Vec<_> = first.split_whitespace().collect();
+    assert!(fields[0].parse::<u64>().unwrap() > 0);
+    assert_eq!(fields[1].parse::<i32>().unwrap(), 2);
+
+    let listener = UnixDatagram::bind(&socket).unwrap();
+    run_hook();
+    assert_eq!(fs::read_to_string(&marker).unwrap(), first);
+    fill_datagram_queue(&socket);
+    for _ in 0..20 {
+        run_hook();
+    }
+    let latest = fs::read_to_string(&marker).unwrap();
+    assert_eq!(latest.len(), 33);
+    let errno = latest
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    assert_eq!(
+        std::io::Error::from_raw_os_error(errno).kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let guide = Command::new(binary)
+        .arg("guide")
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(guide.status.success());
+    let guide = String::from_utf8(guide.stdout).unwrap();
+    assert!(guide.contains("Last failed hook send:"), "{guide}");
+    assert!(guide.contains(&format!("os_error={errno}")), "{guide}");
+
+    drop(listener);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn hook_failure_diagnostics_skip_unsafe_or_unavailable_files() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let dir = PathBuf::from(format!("target/hs-hook-files-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("status.sock");
+    let marker = socket.with_extension("hook-failure");
+    let target = dir.join("untouched");
+    fs::write(&target, "keep").unwrap();
+    std::os::unix::fs::symlink("untouched", &marker).unwrap();
+    run_hook_with_deadline(binary, &socket);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+    fs::remove_file(&marker).unwrap();
+
+    assert!(
+        Command::new("mkfifo")
+            .arg(&marker)
+            .status()
+            .unwrap()
+            .success()
+    );
+    run_hook_with_deadline(binary, &socket);
+    let guide = Command::new(binary)
+        .arg("guide")
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(guide.status.success());
+    assert!(!String::from_utf8_lossy(&guide.stdout).contains("Last failed hook send:"));
+    fs::remove_file(&marker).unwrap();
+
+    for (body, mode) in [("x".repeat(100), 0o600), ("public".to_owned(), 0o644)] {
+        fs::write(&marker, &body).unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(mode)).unwrap();
+        run_hook_with_deadline(binary, &socket);
+        assert_eq!(fs::read_to_string(&marker).unwrap(), body);
+        fs::remove_file(&marker).unwrap();
+    }
+    run_hook_with_deadline(binary, &dir.join("missing/status.sock"));
+    assert!(!dir.join("missing").exists());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+fn run_hook_with_deadline(binary: &str, socket: &Path) {
+    let mut child = Command::new(binary)
+        .args(["hook", "claude"])
+        .env("HARNESS_STATUS_SOCKET", socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        child.stdin.take().unwrap(),
+        &json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "hook-loss-test",
+            "cwd": "/example",
+            "owner_pid": std::process::id(),
+            "prompt": "sensitive-secret"
+        }),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            return;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("hook did not exit within one second");
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn fill_datagram_queue(path: &Path) {
+    // A sender's buffer can fill before the destination queue does. Fresh
+    // senders distinguish that pressure from a full destination queue.
+    for _ in 0..100 {
+        let filler = UnixDatagram::unbound().unwrap();
+        filler.set_nonblocking(true).unwrap();
+        let mut sent = false;
+        loop {
+            match filler.send_to(b"fill", path) {
+                Ok(_) => sent = true,
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                    if !sent {
+                        return;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    panic!("could not fill the destination queue");
+}
+
+#[test]
 fn usage_report_normalizes_local_codex_and_claude_windows() {
     let binary = env!("CARGO_BIN_EXE_harness-status");
     let nonce = SystemTime::now()

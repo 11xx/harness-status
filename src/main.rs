@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,8 @@ const SUBSCRIBER_HEARTBEAT: Duration = Duration::from_secs(2);
 const IDLE_AFTER_SECONDS: u64 = 300;
 const HIDE_IDLE_AFTER_SECONDS: u64 = 3600;
 const CODEX_RECENT_ACTIVITY_SECONDS: u64 = 30;
+const SILENT_TURN_SECONDS: u64 = 15 * 60;
+const CLAUDE_SESSION_RECORD_LIMIT: u64 = 64 * 1024;
 const STATE_VERSION: u32 = 1;
 const CODEX_HOOK_EVENTS: [&str; 2] = ["UserPromptSubmit", "Stop"];
 const CODEX_RETIRED_HOOK_EVENTS: [&str; 0] = [];
@@ -204,6 +206,25 @@ struct HookEvent {
 struct TranscriptCursor {
     path: PathBuf,
     offset: u64,
+    /// Tool calls the transcript opened and has not answered yet. A turn
+    /// waiting on one may be quiet for as long as the tool runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    open_tools: Vec<String>,
+}
+
+impl TranscriptCursor {
+    fn new(path: PathBuf, offset: u64) -> Self {
+        Self {
+            path,
+            offset,
+            open_tools: Vec::new(),
+        }
+    }
+
+    fn rewind(&mut self) {
+        self.offset = 0;
+        self.open_tools.clear();
+    }
 }
 
 #[derive(Default, Clone, Deserialize)]
@@ -234,6 +255,33 @@ struct TranscriptRecord {
 struct TranscriptMessage {
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    content: MessageContent,
+}
+
+/// Claude writes plain prompts as a string and everything else as blocks;
+/// only the blocks that open or answer a tool call matter here.
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Blocks(Vec<ContentBlock>),
+    Other(serde::de::IgnoredAny),
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        Self::Other(serde::de::IgnoredAny)
+    }
+}
+
+#[derive(Clone, Deserialize)]
+struct ContentBlock {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    tool_use_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -301,6 +349,41 @@ impl TranscriptRecord {
         }
     }
 
+    /// The tool calls this record opens, and the ones it answers.
+    fn tool_calls(&self, harness: &str) -> (Vec<&str>, Vec<&str>) {
+        match (harness, self.kind.as_str()) {
+            ("claude", "assistant" | "user") => {
+                let MessageContent::Blocks(blocks) = &self.message.content else {
+                    return (Vec::new(), Vec::new());
+                };
+                let opened = blocks
+                    .iter()
+                    .filter(|block| block.kind == "tool_use")
+                    .filter_map(|block| block.id.as_deref())
+                    .collect();
+                let answered = blocks
+                    .iter()
+                    .filter(|block| block.kind == "tool_result")
+                    .filter_map(|block| block.tool_use_id.as_deref())
+                    .collect();
+                (opened, answered)
+            }
+            ("codex", "response_item") => {
+                let Some(call_id) = self.payload.call_id.as_deref() else {
+                    return (Vec::new(), Vec::new());
+                };
+                if self.payload.kind.ends_with("_call_output") {
+                    (Vec::new(), vec![call_id])
+                } else if self.payload.kind.ends_with("_call") {
+                    (vec![call_id], Vec::new())
+                } else {
+                    (Vec::new(), Vec::new())
+                }
+            }
+            _ => (Vec::new(), Vec::new()),
+        }
+    }
+
     /// Each harness marks an abandoned turn in its own transcript vocabulary.
     fn reports_abort(&self, harness: &str, turn_id: &str) -> bool {
         match harness {
@@ -346,6 +429,8 @@ struct TranscriptPayload {
     effort: Option<String>,
     #[serde(default)]
     turn_id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
     /// A turn the harness closed with an error of its own carries the error
     /// beside its completion, not on the record itself.
     #[serde(default)]
@@ -761,6 +846,46 @@ impl Registry {
         changed
     }
 
+    /// A running turn is a claim its recording has to back. When the
+    /// transcript has been silent for SILENT_TURN_SECONDS with no tool call
+    /// open, the turn ended unreported, and the entry settles as idle
+    /// from its last activity. Claude's own session registry can still vouch
+    /// for a turn that is only slow, such as one waiting on the model.
+    fn settle_silent_turns(&mut self, now: u64, claude_sessions: Option<&Path>) -> bool {
+        let mut changed = false;
+        for entry in &mut self.entries {
+            if entry.status.state != "working" {
+                continue;
+            }
+            let Some(transcript) = entry.transcript.as_ref() else {
+                continue;
+            };
+            if !transcript.open_tools.is_empty() {
+                continue;
+            }
+            let last_activity = modified_seconds(&transcript.path)
+                .unwrap_or(0)
+                .max(entry.status.updated_at);
+            if now.saturating_sub(last_activity) < SILENT_TURN_SECONDS {
+                continue;
+            }
+            if entry.status.harness == "claude"
+                && let Some(sessions) = claude_sessions
+                && claude_session_busy(sessions, entry)
+            {
+                continue;
+            }
+            entry.status.state = "idle".to_owned();
+            entry.status.reason = None;
+            entry.status.background = false;
+            entry.status.updated_at = last_activity;
+            entry.idle_since = Some(last_activity.saturating_add(IDLE_AFTER_SECONDS));
+            entry.hookless = false;
+            changed = true;
+        }
+        changed
+    }
+
     fn reap_dead_owners(&mut self) -> bool {
         let before = self.entries.len();
         self.entries
@@ -910,10 +1035,7 @@ impl Registry {
                 .as_ref()
                 .is_none_or(|transcript| transcript.path != path)
             {
-                entry.transcript = Some(TranscriptCursor {
-                    path: path.to_owned(),
-                    offset: 0,
-                });
+                entry.transcript = Some(TranscriptCursor::new(path.to_owned(), 0));
                 changed = true;
             }
             return changed;
@@ -935,10 +1057,7 @@ impl Registry {
                 updated_at: modified_at,
             },
             owner: Some(owner),
-            transcript: Some(TranscriptCursor {
-                path: path.to_owned(),
-                offset: 0,
-            }),
+            transcript: Some(TranscriptCursor::new(path.to_owned(), 0)),
             hookless: true,
             delegated: false,
         });
@@ -954,17 +1073,17 @@ impl Registry {
                 && entry.status.state == "working"
                 && let Some(transcript) = entry.transcript.as_mut()
             {
-                transcript.offset = 0;
+                transcript.rewind();
             }
         }
     }
 
     /// Tails each running turn's transcript for the facts a lifecycle hook
     /// never delivers: that the user interrupted the turn, that the harness
-    /// ended the turn with an error of its own, and which model answered it.
-    /// It also catches an end whose hook never arrived. An interrupt retires
-    /// the entry; a failure or a recovered end settles it, with the
-    /// notification that transition deserves.
+    /// ended the turn with an error of its own, which model answered it, and
+    /// which tool calls are still open. It also catches an end whose hook
+    /// never arrived. An interrupt retires the entry; a failure or a recovered
+    /// end settles it, with the notification that transition deserves.
     fn follow_running_transcripts(&mut self) -> (bool, Option<Notification>) {
         let before = self.entries.len();
         let mut changed = false;
@@ -1225,6 +1344,12 @@ Read `state` on each thread:
   idle        settled five minutes ago, or Claude Code reported idle
   attention   the turn wants the user: permission, elicitation, subagent,
               or failure
+
+`working` is backed by the session's transcript, not by the last hook alone.
+A turn whose transcript has been silent for 15 minutes with no tool call
+open reads `idle` from its last activity, unless Claude Code's own session
+registry names it busy; a Claude turn whose Stop report was lost settles
+from the transcript's record of that Stop.
 
 A thread stays listed until you acknowledge it, its session ends, or its
 owning process exits. `harness-status ack THREAD_ID` does the first.
@@ -2062,6 +2187,35 @@ fn record_timestamp(record: &TranscriptRecord) -> Option<u64> {
         .ok()
 }
 
+/// Claude Code keeps one record per live process, named by its pid, saying
+/// which session it runs and whether that session is busy.
+fn claude_session_busy(sessions: &Path, entry: &Entry) -> bool {
+    #[derive(Deserialize)]
+    struct SessionRecord {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(default)]
+        status: String,
+    }
+
+    let Some(owner) = entry.owner.as_ref() else {
+        return false;
+    };
+    let Ok(file) = fs::File::open(sessions.join(format!("{}.json", owner.pid))) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(CLAUDE_SESSION_RECORD_LIMIT)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return false;
+    }
+    serde_json::from_slice::<SessionRecord>(&bytes)
+        .is_ok_and(|record| record.session_id == entry.status.id && record.status == "busy")
+}
+
 fn modified_seconds(path: &Path) -> Option<u64> {
     fs::metadata(path)
         .ok()?
@@ -2755,7 +2909,9 @@ fn follow_as_owner(
     let mut registry = load_registry(&state_path);
     registry.rewind_running_transcripts();
     registry.discover_codex_sessions();
+    let claude_sessions = claude_config_dir().ok().map(|dir| dir.join("sessions"));
     registry.follow_running_transcripts();
+    registry.settle_silent_turns(unix_time_seconds(), claude_sessions.as_deref());
     registry.reap_dead_owners();
     checkpoint_registry(&state_path, &registry);
     let mut subscribers = Vec::new();
@@ -2818,6 +2974,7 @@ fn follow_as_owner(
         if notification.is_none() {
             notification = transcript_failure;
         }
+        changed |= registry.settle_silent_turns(unix_time_seconds(), claude_sessions.as_deref());
         changed |= registry.settle_quiet_entries();
         changed |= registry.reap_dead_owners();
         if changed {
@@ -3077,11 +3234,11 @@ fn send_hook(harness: &str) {
     let transcript = matches!(harness, "codex" | "claude")
         .then_some(input.transcript_path)
         .flatten()
-        .map(|path| TranscriptCursor {
-            offset: fs::metadata(&path)
+        .map(|path| {
+            let offset = fs::metadata(&path)
                 .map(|metadata| metadata.len())
-                .unwrap_or(0),
-            path,
+                .unwrap_or(0);
+            TranscriptCursor::new(path, offset)
         });
     let owner = input
         .owner_pid
@@ -3114,7 +3271,7 @@ fn read_transcript_turn(
 ) -> io::Result<TurnReport> {
     let mut file = fs::File::open(&cursor.path)?;
     if file.metadata()?.len() < cursor.offset {
-        cursor.offset = 0;
+        cursor.rewind();
     }
     file.seek(SeekFrom::Start(cursor.offset))?;
     let mut reader = BufReader::new(file);
@@ -3135,8 +3292,19 @@ fn read_transcript_turn(
             continue;
         };
         if let Some(prompt_id) = record.prompt_id.as_deref() {
-            in_other_turn = prompt_id != turn_id;
+            let other = prompt_id != turn_id;
+            if in_other_turn && !other {
+                cursor.open_tools.clear();
+            }
+            in_other_turn = other;
         }
+        let (opened, answered) = record.tool_calls(harness);
+        cursor
+            .open_tools
+            .retain(|open| !answered.contains(&open.as_str()));
+        cursor
+            .open_tools
+            .extend(opened.into_iter().map(str::to_owned));
         if let Some(model) = record.reported_model(harness) {
             report.model = Some(model);
         }
@@ -3842,10 +4010,10 @@ mod tests {
         let mut registry = Registry::default();
         let mut start = event("UserPromptSubmit", None);
         start.turn_id = Some("turn-limit".to_owned());
-        start.transcript = Some(TranscriptCursor {
-            path: env::temp_dir().join("harness-status-absent-transcript.jsonl"),
-            offset: 0,
-        });
+        start.transcript = Some(TranscriptCursor::new(
+            env::temp_dir().join("harness-status-absent-transcript.jsonl"),
+            0,
+        ));
         registry.apply_hook("codex", start, None);
         registry.entries[0].status.started_at = Some(1_000);
         registry.entries[0].status.updated_at = 1_000;
@@ -3861,6 +4029,7 @@ mod tests {
                 model: None,
                 effort: None,
                 turn_id: Some("turn-limit".to_owned()),
+                call_id: None,
                 error: Some(json!({"codex_error_info": "usage_limit_exceeded"})),
             },
             prompt_id: None,
@@ -3915,10 +4084,7 @@ mod tests {
             ),
         )
         .unwrap();
-        registry.entries[0].transcript = Some(TranscriptCursor {
-            path: transcript.clone(),
-            offset: 0,
-        });
+        registry.entries[0].transcript = Some(TranscriptCursor::new(transcript.clone(), 0));
         let (changed, notification) = registry.follow_running_transcripts();
         assert!(changed);
         assert_eq!(registry.entries.len(), 1);
@@ -3972,10 +4138,7 @@ mod tests {
         let mut registry = Registry::default();
         let mut start = event("UserPromptSubmit", None);
         start.turn_id = Some("turn-now".to_owned());
-        start.transcript = Some(TranscriptCursor {
-            path: transcript.clone(),
-            offset: 0,
-        });
+        start.transcript = Some(TranscriptCursor::new(transcript.clone(), 0));
         registry.apply_hook("claude", start, None);
         let (_, notification) = registry.follow_running_transcripts();
         assert!(notification.is_none());
@@ -4013,10 +4176,7 @@ mod tests {
         let mut registry = Registry::default();
         let mut start = event_with_delegation("UserPromptSubmit", None, true);
         start.turn_id = Some("turn-now".to_owned());
-        start.transcript = Some(TranscriptCursor {
-            path: transcript.clone(),
-            offset: 0,
-        });
+        start.transcript = Some(TranscriptCursor::new(transcript.clone(), 0));
         registry.apply_hook("claude", start, None);
         append_records(&transcript, &[stop_summary(false)]);
         let (changed, notification) = registry.follow_running_transcripts();
@@ -4027,16 +4187,44 @@ mod tests {
     }
 
     #[test]
+    fn open_tool_calls_follow_each_harness_vocabulary() {
+        let record = |value: Value| serde_json::from_value::<TranscriptRecord>(value).unwrap();
+        let claude_use = record(json!({"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": ""},
+            {"type": "tool_use", "id": "toolu-1", "name": "Bash", "input": {}}
+        ]}}));
+        assert_eq!(claude_use.tool_calls("claude"), (vec!["toolu-1"], vec![]));
+        let claude_result = record(
+            json!({"type": "user", "promptId": "p", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu-1", "content": "done"}
+            ]}}),
+        );
+        assert_eq!(
+            claude_result.tool_calls("claude"),
+            (vec![], vec!["toolu-1"])
+        );
+        let claude_prompt = record(json!({"type": "user", "message": {"content": "text"}}));
+        assert_eq!(claude_prompt.tool_calls("claude"), (vec![], vec![]));
+
+        let codex_call = record(json!({"type": "response_item",
+            "payload": {"type": "custom_tool_call", "call_id": "call-1"}}));
+        assert_eq!(codex_call.tool_calls("codex"), (vec!["call-1"], vec![]));
+        let codex_output = record(json!({"type": "response_item",
+            "payload": {"type": "function_call_output", "call_id": "call-1"}}));
+        assert_eq!(codex_output.tool_calls("codex"), (vec![], vec!["call-1"]));
+    }
+
+    #[test]
     fn a_turn_aborted_during_the_tail_still_retires_without_notifying() {
         // The abort path is exercised end to end by the smoke suite; here the
         // empty-report default proves an absent transcript retires nothing.
         let mut registry = Registry::default();
         let mut start = event("UserPromptSubmit", None);
         start.turn_id = Some("turn-x".to_owned());
-        start.transcript = Some(TranscriptCursor {
-            path: PathBuf::from("/harness-status-nonexistent/transcript.jsonl"),
-            offset: 0,
-        });
+        start.transcript = Some(TranscriptCursor::new(
+            PathBuf::from("/harness-status-nonexistent/transcript.jsonl"),
+            0,
+        ));
         registry.apply_hook("codex", start, None);
         let (changed, notification) = registry.follow_running_transcripts();
         assert!(!changed);
@@ -4048,26 +4236,26 @@ mod tests {
     fn restoring_a_checkpoint_rewinds_running_transcripts() {
         let mut registry = Registry::default();
         let mut start = event("UserPromptSubmit", None);
-        start.transcript = Some(TranscriptCursor {
-            path: PathBuf::from("/tmp/codex-rollout.jsonl"),
-            offset: 9_999,
-        });
+        start.transcript = Some(TranscriptCursor::new(
+            PathBuf::from("/tmp/codex-rollout.jsonl"),
+            9_999,
+        ));
         registry.apply_hook("codex", start, None);
 
         let mut claude_start = event("UserPromptSubmit", None);
-        claude_start.transcript = Some(TranscriptCursor {
-            path: PathBuf::from("/tmp/claude-transcript.jsonl"),
-            offset: 9_999,
-        });
+        claude_start.transcript = Some(TranscriptCursor::new(
+            PathBuf::from("/tmp/claude-transcript.jsonl"),
+            9_999,
+        ));
         registry.apply_hook("claude", claude_start, None);
 
         // A settled thread is left where its last tail put it.
         let mut settled_start = event("UserPromptSubmit", None);
         settled_start.session_id = "settled".to_owned();
-        settled_start.transcript = Some(TranscriptCursor {
-            path: PathBuf::from("/tmp/settled-transcript.jsonl"),
-            offset: 9_999,
-        });
+        settled_start.transcript = Some(TranscriptCursor::new(
+            PathBuf::from("/tmp/settled-transcript.jsonl"),
+            9_999,
+        ));
         registry.apply_hook("claude", settled_start, None);
         let mut settled_stop = event("Stop", None);
         settled_stop.session_id = "settled".to_owned();

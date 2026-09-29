@@ -215,6 +215,12 @@ The `state` field is `working`, `completed`, `idle`, or `attention`:
   `stop_hook_summary` record that did not prevent continuation), and the
   transcript tail settles the turn as `completed` from that record when the
   hook's own report never arrived.
+- `working` is a claim the session's transcript has to back. A Codex or Claude
+  turn whose transcript has been silent for 15 minutes with no tool call open
+  becomes `idle`, dated from its last activity, without a notification. Claude
+  Code's session registry (`sessions/<pid>.json` in its configuration
+  directory, read up to 64 KiB and never written) can still vouch for it: a
+  record naming the session as `busy` keeps it `working`.
 - A completed thread becomes `idle` once it has waited five minutes, or as soon
   as Claude Code reports its own `idle_prompt`. Waiting is not attention: an
   idle report never creates a thread and never interrupts one that is working.
@@ -286,7 +292,10 @@ hook-sourced turn runs both adapters tail only the records their own hook added
 to the transcript since the turn began. Codex recognizes its turn-abort event,
 and Claude Code an interrupted-message record carrying the same prompt
 identifier; either one retires the entry. A Codex rollout recovered from its
-native records uses the same tail for later aborts and completions. Codex's
+native records uses the same tail for later aborts and completions. The tail
+also pairs each tool call with its result, and the checkpoint keeps only the
+identifiers of calls still open, which is what lets a long-running tool keep a
+silent turn `working`. Codex's
 `turn_context` records repeat the active model and effort, including after an in-session
 model switch, so the running entry keeps its model current from the transcript
 tail. Codex also ends a usage-limit turn

@@ -1550,6 +1550,173 @@ fn claude_hook_to_jsonl_smoke() {
 }
 
 #[test]
+fn claude_stop_whose_report_is_lost_settles_from_the_transcript() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("harness-lost-stop-{nonce}"));
+    fs::create_dir(&dir).unwrap();
+    let socket = dir.join("status.sock");
+    let child = Command::new(binary)
+        .args(["claude", "--follow"])
+        .env("CLAUDE_CONFIG_DIR", dir.join("claude-config"))
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _follower = Follower {
+        child,
+        dir: dir.clone(),
+    };
+    wait_for_socket(&socket);
+
+    let transcript = dir.join("claude-transcript.jsonl");
+    fs::write(&transcript, "").unwrap();
+    send_hook(
+        binary,
+        &socket,
+        "claude",
+        "UserPromptSubmit",
+        Some(&transcript),
+    );
+    wait_for_state(binary, &socket, "claude", "working");
+
+    // Claude ran its Stop hook and recorded that it did, but the hook's
+    // report never reached the registry.
+    let mut transcript_file = fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    for record in [
+        json!({
+            "type": "user",
+            "promptId": "prompt-smoke",
+            "message": {"role": "user", "content": "a prompt"}
+        }),
+        json!({
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 1,
+            "preventedContinuation": false
+        }),
+    ] {
+        writeln!(transcript_file, "{record}").unwrap();
+    }
+    wait_for_state(binary, &socket, "claude", "completed");
+}
+
+#[test]
+fn silent_running_turns_are_not_reported_working() {
+    let binary = env!("CARGO_BIN_EXE_harness-status");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let dir = std::env::temp_dir().join(format!("harness-silent-{}-{now}", std::process::id()));
+    let sessions = dir.join("claude-config/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let socket = dir.join("status.sock");
+    let quiet_since = now - 2 * 3600;
+
+    let write_transcript = |name: &str, records: &[Value]| {
+        let path = dir.join(name);
+        let body: String = records.iter().map(|record| format!("{record}\n")).collect();
+        fs::write(&path, body).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(quiet_since))
+            .unwrap();
+        path
+    };
+    let prompt =
+        |turn: &str| json!({"type": "user", "promptId": turn, "message": {"content": "go"}});
+    let silent = write_transcript("silent.jsonl", &[prompt("turn-silent")]);
+    let tool = write_transcript(
+        "tool.jsonl",
+        &[
+            prompt("turn-tool"),
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu-running", "name": "Bash", "input": {}}
+            ]}}),
+        ],
+    );
+    let busy = write_transcript("busy.jsonl", &[prompt("turn-busy")]);
+
+    // Claude's registry names its own process; the test process stands in.
+    let pid = std::process::id();
+    let stat = fs::read_to_string("/proc/self/stat").unwrap();
+    let start_ticks: u64 = stat[stat.rfind(')').unwrap() + 2..]
+        .split_ascii_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    fs::write(
+        sessions.join(format!("{pid}.json")),
+        json!({"pid": pid, "sessionId": "busy", "status": "busy"}).to_string(),
+    )
+    .unwrap();
+
+    let entry = |id: &str, transcript: &Path, owner: Value| {
+        json!({
+            "status": {"id": id, "harness": "claude", "state": "working",
+                "cwd": "/example", "name": "example", "turn_id": format!("turn-{id}"),
+                "started_at": quiet_since, "updated_at": quiet_since},
+            "owner": owner,
+            "transcript": {"path": transcript, "offset": 0}
+        })
+    };
+    fs::write(
+        state_path(&socket),
+        json!({
+            "version": 1,
+            "entries": [
+                entry("silent", &silent, Value::Null),
+                entry("tool", &tool, Value::Null),
+                entry("busy", &busy, json!({"pid": pid, "start_ticks": start_ticks})),
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let child = Command::new(binary)
+        .args(["claude", "--follow"])
+        .env("CLAUDE_CONFIG_DIR", dir.join("claude-config"))
+        .env("HARNESS_STATUS_SOCKET", &socket)
+        .env("HARNESS_STATUS_NOTIFY", "0")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _follower = Follower {
+        child,
+        dir: dir.clone(),
+    };
+    wait_for_socket(&socket);
+
+    let view = snapshot(binary, &socket, "claude");
+    let threads = view["threads"].as_array().unwrap();
+    let state = |id: &str| {
+        threads
+            .iter()
+            .find(|thread| thread["id"] == id)
+            .map(|thread| thread["state"].as_str().unwrap().to_owned())
+    };
+    assert_eq!(state("silent").as_deref(), Some("idle"));
+    assert_eq!(state("tool").as_deref(), Some("working"));
+    assert_eq!(state("busy").as_deref(), Some("working"));
+    let silent_view = threads
+        .iter()
+        .find(|thread| thread["id"] == "silent")
+        .unwrap();
+    assert_eq!(silent_view["updated_at"], quiet_since);
+}
+
+#[test]
 fn desktop_notifications_are_generic_and_transition_only() {
     let binary = env!("CARGO_BIN_EXE_harness-status");
     let nonce = SystemTime::now()
@@ -1768,6 +1935,10 @@ fn guide_explains_follow_and_which_harnesses_report() {
             "Non-interactive runs (codex exec, pi -p, claude -p) are reported by the same adapters"
         ),
         "guide must say which harnesses report non-interactive runs: {guide}"
+    );
+    assert!(
+        flat.contains("silent for 15 minutes with no tool call open reads `idle`"),
+        "guide must say when a working state stops being reported: {guide}"
     );
 }
 

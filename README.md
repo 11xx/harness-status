@@ -135,6 +135,8 @@ seed the report when the app server is unavailable, and a session observation
 newer than the cached app-server value replaces it; each observation is dated
 by its own event. Claude's status line passes its already-delivered payload to
 `harness-status usage ingest claude`.
+Disabled ingestion exits successfully without reading stdin. Pipe writers must
+tolerate a broken pipe only after confirming that the child exited successfully.
 Passive Claude payloads fill windows that are missing from the cache but do not
 overwrite complete values obtained from the authoritative usage endpoint.
 The cache and provider refresh deadlines live in a user-private runtime file.

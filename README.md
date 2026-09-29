@@ -34,6 +34,17 @@ keeps only status metadata, attempts one non-blocking send, and exits. It
 deliberately returns success when no follower is running so status reporting
 cannot delay or break the harness.
 
+If the socket cannot accept a hook, the command makes one best-effort write
+to a private file beside the socket with extension `hook-failure`. The fixed
+33-byte line contains only the Unix timestamp and OS error code of the latest
+failure, including a missing listener or a full socket queue. Successful sends
+leave that marker intact. `harness-status guide` displays its timestamp and
+error code when readable; the snapshot JSON contract stays the same. Recording
+does not lock, retry, sync to disk, or create directories. An unavailable,
+oversized, non-private, symlink, or non-regular diagnostic file is skipped;
+the hook still exits successfully. The marker is bounded diagnostic evidence,
+not a delivery counter or acknowledgement.
+
 The Codex owner also reconciles a recent rollout when its hook was not
 delivered. A `task_started` record, a later `task_complete` or `turn_aborted`
 record, and a live Codex process in the rollout's recorded directory provide
@@ -159,8 +170,13 @@ provider-specific contract.
 If no follower is running, snapshot mode prints `{"threads":[]}`. Only one
 follower owns the registry, but any number of later `--follow` processes can
 subscribe to its current snapshot and future changes. Each subscriber keeps
-its own optional harness filter. If the owner exits, subscribers return to
-owner election; one restores the runtime checkpoint and the others resubscribe.
+its own optional harness filter. The owner uses a separate non-blocking socket
+for all client replies, so a full client queue cannot delay receiving hooks.
+It drops snapshot replies that cannot be sent and evicts a subscriber whose
+initial reply, heartbeat reply, or changed snapshot cannot be sent. A follower
+that drains its queue can resubscribe on its next two-second heartbeat.
+If the owner exits, subscribers return to owner election; one restores the
+runtime checkpoint and the others resubscribe.
 Election is contended by design: losing the race to retire a dead owner's
 socket, or querying an owner that answers too slowly, makes a process a
 subscriber rather than ending it, because a status bar cannot restart a

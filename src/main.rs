@@ -3,7 +3,7 @@ use serde_json::{Map, Value, json};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SOCKET_NAME: &str = "harness-status.sock";
 const MAX_DATAGRAM_SIZE: usize = 64 * 1024;
+const HOOK_FAILURE_RECORD_SIZE: u64 = 33;
 const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const REAP_INTERVAL: Duration = Duration::from_millis(500);
 const CODEX_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
@@ -1351,6 +1352,12 @@ open reads `idle` from its last activity, unless Claude Code's own session
 registry names it busy; a Claude turn whose Stop report was lost settles
 from the transcript's record of that Stop.
 
+Hooks attempt one non-blocking send and always exit successfully. A failed
+send leaves a best-effort 33-byte marker beside the socket, with extension
+`hook-failure`: Unix timestamp and OS error code only. It keeps the latest
+failure, even after successful sends. Recording uses no lock, retry, or sync;
+an unavailable diagnostic file is skipped. `guide` displays a readable marker.
+
 A thread stays listed until you acknowledge it, its session ends, or its
 owning process exits. `harness-status ack THREAD_ID` does the first.
 
@@ -1361,12 +1368,20 @@ mode an empty payload. An empty snapshot means no report, not death.
 To wait for a change instead of polling, run `--follow`: it owns the registry
 (or subscribes to the process already owning it) and prints one JSON object
 per line as snapshots change.
+Owner replies are non-blocking. A subscriber whose socket cannot accept a
+snapshot is evicted; it can resubscribe on its next heartbeat. A full client
+queue cannot hold up hook processing or replies to other clients.
 
 `harness-status usage` prints normalized Codex and Claude account windows.
 The README documents the full JSON contract.";
 
 fn print_guide() {
     println!("{GUIDE}");
+    if let Ok(path) = socket_path()
+        && let Some((timestamp, os_error)) = read_hook_failure(&path)
+    {
+        println!("\nLast failed hook send: unix_seconds={timestamp} os_error={os_error}");
+    }
 }
 
 fn print_help() {
@@ -2902,6 +2917,8 @@ fn follow_as_owner(
     };
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     socket.set_read_timeout(Some(REAP_INTERVAL))?;
+    let replies = UnixDatagram::unbound()?;
+    replies.set_nonblocking(true)?;
     cleanup_stale_client_sockets(path)?;
 
     let state_path = registry_state_path(path);
@@ -2939,13 +2956,13 @@ fn follow_as_owner(
                         Request::Snapshot { harness: requested } => {
                             if let Some(sender_path) = sender.as_pathname() {
                                 let response = registry.snapshot_json(requested.as_deref());
-                                let _ = socket.send_to(response.as_bytes(), sender_path);
+                                let _ = replies.send_to(response.as_bytes(), sender_path);
                             }
                         }
                         Request::Subscribe { harness: requested } => {
                             if let Some(sender_path) = sender.as_pathname() {
                                 subscribe(
-                                    &socket,
+                                    &replies,
                                     &registry,
                                     &mut subscribers,
                                     sender_path,
@@ -2985,7 +3002,7 @@ fn follow_as_owner(
         // last sent, which keeps a still registry silent.
         let json = registry.snapshot_json(harness);
         print_json_if_changed(last_json, json);
-        publish_subscribers(&socket, &registry, &mut subscribers);
+        publish_subscribers(&replies, &registry, &mut subscribers);
         if let Some(notification) = notification {
             notifier.send(notification);
         }
@@ -3180,6 +3197,7 @@ fn subscribe(
 ) {
     let json = registry.snapshot_json(harness.as_deref());
     if socket.send_to(json.as_bytes(), path).is_err() {
+        subscribers.retain(|subscriber| subscriber.path != path);
         return;
     }
 
@@ -3343,13 +3361,61 @@ fn send_fire_and_forget(request: &Request) {
     let Ok(path) = socket_path() else {
         return;
     };
-    let Ok(socket) = UnixDatagram::unbound() else {
+    let result = (|| {
+        let socket = UnixDatagram::unbound()?;
+        socket.set_nonblocking(true)?;
+        socket.send_to(&bytes, &path)
+    })();
+    if let Err(error) = result {
+        record_hook_failure(&path, &error);
+    }
+}
+
+fn record_hook_failure(socket_path: &Path, error: &io::Error) {
+    let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(socket_path.with_extension("hook-failure"))
+    else {
         return;
     };
-    if socket.set_nonblocking(true).is_err() {
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    if !metadata.is_file()
+        || metadata.len() > HOOK_FAILURE_RECORD_SIZE
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
         return;
     }
-    let _ = socket.send_to(&bytes, path);
+    let record = format!(
+        "{:020} {:011}\n",
+        unix_time_seconds(),
+        error.raw_os_error().unwrap_or(0)
+    );
+    let _ = file.write(record.as_bytes());
+}
+
+fn read_hook_failure(socket_path: &Path) -> Option<(u64, i32)> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(socket_path.with_extension("hook-failure"))
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() != HOOK_FAILURE_RECORD_SIZE {
+        return None;
+    }
+    let mut record = String::new();
+    file.take(HOOK_FAILURE_RECORD_SIZE)
+        .read_to_string(&mut record)
+        .ok()?;
+    let mut fields = record.split_whitespace();
+    let timestamp = fields.next()?.parse().ok()?;
+    let os_error = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some((timestamp, os_error))
 }
 
 fn print_snapshot(harness: Option<&str>) -> io::Result<()> {

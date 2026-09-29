@@ -303,7 +303,7 @@ fn claude_usage_and_ping_toggles_are_independent_and_reversible() {
             .output()
             .unwrap()
     };
-    let ingest = |payload: Value| {
+    let ingest = |payload: Value, exits_without_input: bool| {
         let mut child = Command::new(binary)
             .args(["usage", "ingest", "claude"])
             .env("XDG_STATE_HOME", &state_home)
@@ -311,20 +311,29 @@ fn claude_usage_and_ping_toggles_are_independent_and_reversible() {
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
+        let mut stdin = child.stdin.take().unwrap();
+        if exits_without_input {
+            assert!(child.wait().unwrap().success());
+        }
+        let written = stdin
             .write_all(payload.to_string().as_bytes())
-            .unwrap();
+            .map_err(|error| error.kind());
+        drop(stdin);
         assert!(child.wait().unwrap().success());
+        assert!(written.is_ok() || written == Err(std::io::ErrorKind::BrokenPipe));
+        if exits_without_input {
+            assert_eq!(written, Err(std::io::ErrorKind::BrokenPipe));
+        }
     };
 
-    ingest(json!({
-        "rate_limits": {
-            "five_hour": {"used_percentage": 20, "resets_at": 1_999_999_999_u64}
-        }
-    }));
+    ingest(
+        json!({
+            "rate_limits": {
+                "five_hour": {"used_percentage": 20, "resets_at": 1_999_999_999_u64}
+            }
+        }),
+        false,
+    );
     let disabled = run(["usage", "disable"].as_slice());
     assert!(disabled.status.success());
     assert!(
@@ -333,11 +342,15 @@ fn claude_usage_and_ping_toggles_are_independent_and_reversible() {
             .is_file()
     );
 
-    ingest(json!({
-        "rate_limits": {
-            "five_hour": {"used_percentage": 90, "resets_at": 1_999_999_999_u64}
-        }
-    }));
+    // Disabled ingestion must succeed even while its caller holds stdin open.
+    ingest(
+        json!({
+            "rate_limits": {
+                "five_hour": {"used_percentage": 90, "resets_at": 1_999_999_999_u64}
+            }
+        }),
+        true,
+    );
     let report: Value = serde_json::from_slice(&run(["usage"].as_slice()).stdout).unwrap();
     assert_eq!(report["claude"]["state"], "disabled");
     assert!(report["claude"]["five_hour"].is_null());

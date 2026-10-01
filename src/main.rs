@@ -1335,8 +1335,8 @@ harness-status guide
 
 Answers one question: which harness sessions are live, and which want you.
 It reports session state, not a process listing: `completed` means a turn
-settled, and a delegated run's exit status is the launcher's record
-(agent-delegate).
+settled, and a delegated run's exit status is recorded by whatever
+launched it.
 
 Bare invocation prints one snapshot as JSON; a harness name narrows it.
 Read `state` on each thread:
@@ -1373,7 +1373,8 @@ snapshot is evicted; it can resubscribe on its next heartbeat. A full client
 queue cannot hold up hook processing or replies to other clients.
 
 `harness-status usage` prints normalized Codex and Claude account windows.
-The README documents the full JSON contract.";
+docs/reference.md in the source repository documents the full JSON
+contract.";
 
 fn print_guide() {
     println!("{GUIDE}");
